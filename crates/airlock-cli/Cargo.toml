@@ -1,0 +1,20 @@
+[package]
+name = "airlock-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Airlock CLI, MCP server, agent hooks and tower TUI"
+
+[[bin]]
+name = "airlock"
+path = "src/main.rs"
+
+[dependencies]
+airlock-core = { path = "../airlock-core" }
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+uuid.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true

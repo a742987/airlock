@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt --check
+
+  test-linux:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      matrix:
+        # 内核矩阵：≥5.13 支持 Landlock（L2 真实拦截可测）；L1 全平台兜底（§7 风险表降级链）
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 单元 + 集成测试（含 1000 并发混沌、L2 Landlock 真实拦截）
+        run: cargo test --workspace
+      - name: 性能预算门禁（release：claim p50<5ms / p99<50ms，§8.1）
+        run: cargo test --release -p airlockd --test integration perf_claim_latency_budget
+
+  test-macos:
+    # macOS：仅 L1 advisory（兼容矩阵 §8.2）；doctor 报告不可用原因且退出码 0（AC2.3）
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: macOS（L1）全量测试——Landlock 用例自动跳过（内核门控）
+        run: cargo test --workspace
+
+  test-windows-wsl:
+    # v0.1 的 Windows 支持形态 = WSL2（等效 Linux 矩阵，§8.2）；原生 L2W 自 v2.5 起
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-22.04
+      # 注：rust-cache 运行在 Windows 侧，仅能覆盖检出目录（DrvFS）中的 target/；
+      # WSL 内部的 CARGO_HOME（注册表索引）不在其缓存范围，聊胜于无。
+      - uses: Swatinem/rust-cache@v2
+      - name: WSL2 内安装 Rust 并测试
+        shell: wsl-bash {0}
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          source "$HOME/.cargo/env"
+          cargo test --workspace

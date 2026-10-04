@@ -1,0 +1,6 @@
+/target
+*.db
+*.db-wal
+*.db-shm
+.v2c/
+.airlock/
