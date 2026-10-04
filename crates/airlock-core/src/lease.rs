@@ -134,6 +134,8 @@ fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result
         last_heartbeat: now_ts,
         expires_at,
         enforcement_layer: p.layer.clone(),
+        tokens_used: 0,
+        cost_cents: 0,
     };
     store.insert_lease(&lease)?;
 
@@ -152,7 +154,24 @@ fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result
 
     store.audit("grant", &p.actor, &p.glob, Some(&lease.id), &p.layer, None)?;
 
-    let prediction = crate::predict::predict(&actives, &p.glob);
+    // F5：符号级冲突预测（当有 repo root 时启用 tree-sitter 分析）
+    let prediction = match p.root.as_deref() {
+        Some(root_path) => {
+            let overlapping_files = find_overlapping_files(&actives, &p.glob, root_path);
+            let reader = |path: &std::path::Path| -> Option<String> {
+                let full = root_path.join(path);
+                std::fs::read_to_string(full).ok()
+            };
+            // F7：创建租约快照（保存在 repo root 的 .airlock/snapshots 下）
+            if let Ok(snap) = crate::snapshot::create_snapshot(root_path, &lease.id) {
+                let snap_dir = root_path.join(".airlock").join("snapshots");
+                let _ = std::fs::create_dir_all(&snap_dir);
+                let _ = crate::snapshot::save_snapshot_to(&snap_dir, &snap);
+            }
+            crate::predict::predict(&actives, &p.glob, &overlapping_files, Some(reader))
+        }
+        None => crate::predict::predict_simple(&actives, &p.glob),
+    };
     Ok(ClaimOk { lease, prediction })
 }
 
@@ -245,6 +264,7 @@ pub fn release(
     actor: &Actor,
     layer: &str,
     expected_session: Option<&str>,
+    root: Option<&Path>,
 ) -> Result<bool> {
     let Some(lease) = store.get_lease(lease_id)? else {
         return Ok(false);
@@ -253,6 +273,16 @@ pub fn release(
         return Ok(false);
     }
     check_ownership(&lease, expected_session)?;
+
+    // F7：完成快照（记录变更文件）
+    if let Some(root_path) = root {
+        let snap_dir = root_path.join(".airlock").join("snapshots");
+        if let Ok(Some(mut snap)) = crate::snapshot::load_snapshot_from(&snap_dir, lease_id) {
+            let _ = crate::snapshot::finalize_snapshot(root_path, &mut snap);
+            let _ = crate::snapshot::save_snapshot_to(&snap_dir, &snap);
+        }
+    }
+
     store.update_lease_state(lease_id, LEASE_RELEASED)?;
     store.archive_board_by_lease(lease_id)?;
     store.audit(
@@ -321,11 +351,20 @@ fn check_ownership(lease: &LeaseInfo, expected_session: Option<&str>) -> Result<
 
 /// 过期清扫（FR1.3）：心跳停止 2 个周期（expires_at = last_heartbeat + ttl，TTL ≥ 2 周期）后
 /// 自动过期释放；黑板条目归档；daemon 依据审计日志生成不可抵赖的黑板摘要（FR5.4）。
-pub fn sweep(store: &Store, layer: &str) -> Result<Vec<LeaseInfo>> {
+pub fn sweep(store: &Store, layer: &str, root: Option<&Path>) -> Result<Vec<LeaseInfo>> {
     let now_ts = now();
     let to_expire = store.leases_to_expire(now_ts)?;
     let mut expired = Vec::new();
     for lease in to_expire {
+        // F7：完成快照（记录变更文件）- 在状态变更前
+        if let Some(root_path) = root {
+            let snap_dir = root_path.join(".airlock").join("snapshots");
+            if let Ok(Some(mut snap)) = crate::snapshot::load_snapshot_from(&snap_dir, &lease.id) {
+                let _ = crate::snapshot::finalize_snapshot(root_path, &mut snap);
+                let _ = crate::snapshot::save_snapshot_to(&snap_dir, &snap);
+            }
+        }
+
         store.update_lease_state(&lease.id, LEASE_EXPIRED)?;
         store.archive_board_by_lease(&lease.id)?;
         store.audit(
@@ -368,8 +407,8 @@ fn ts_display(ts: i64) -> String {
 }
 
 /// 守护进程周期任务：过期清扫 + 黑板 7 天归档保留 + 已结束会话资源清理。
-pub fn sweep_all(store: &Store, layer: &str, session_root: &Path) -> Result<Vec<LeaseInfo>> {
-    let expired = sweep(store, layer)?;
+pub fn sweep_all(store: &Store, layer: &str, session_root: &Path, root: Option<&Path>) -> Result<Vec<LeaseInfo>> {
+    let expired = sweep(store, layer, root)?;
     store.board_purge(7)?;
     // AC3.3：会话结束 60s 内销毁临时资源
     let cutoff = now() - 60;
@@ -407,15 +446,77 @@ pub fn recent_events(store: &Store, limit: usize) -> Result<Vec<AuditEntry>> {
 }
 
 /// L1 advisory 的 release_all。
-pub fn release_all(store: &Store, session_id: &str, actor: &Actor, layer: &str) -> Result<usize> {
+pub fn release_all(
+    store: &Store,
+    session_id: &str,
+    actor: &Actor,
+    layer: &str,
+    root: Option<&Path>,
+) -> Result<usize> {
     let now_ts = now();
     let actives = store.active_leases(None, now_ts)?;
     let mut n = 0;
     for l in actives.iter().filter(|l| l.session_id == session_id) {
         // release_all 本身按 session 过滤，无需二次属主校验
-        if release(store, &l.id, actor, layer, None)? {
+        if release(store, &l.id, actor, layer, None, root)? {
             n += 1;
         }
     }
     Ok(n)
+}
+
+/// F5：找出在多个 active 租约重叠区域内的文件（用于符号级冲突预测）。
+fn find_overlapping_files(
+    actives: &[crate::proto::LeaseInfo],
+    want: &str,
+    root: &std::path::Path,
+) -> Vec<String> {
+    let mut result = Vec::new();
+    // 遍历仓库文件，找出同时匹配 want 和至少一个 active 租约的文件
+    let walker = walkdir_simple(root, 4); // 限制深度避免性能问题
+    for entry in walker {
+        let rel = match entry.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+        if crate::glob::matches(want, &rel) {
+            // 检查是否也在某个 active 租约范围内
+            for active in actives {
+                if crate::glob::matches(&active.glob, &rel) {
+                    result.push(rel);
+                    break;
+                }
+            }
+        }
+    }
+    result
+}
+
+/// 简单的目录遍历（不跟随符号链接，限制深度）。
+fn walkdir_simple(root: &std::path::Path, max_depth: usize) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > max_depth {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // 跳过隐藏目录和常见大目录
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            } else {
+                result.push(path);
+            }
+        }
+    }
+    result
 }

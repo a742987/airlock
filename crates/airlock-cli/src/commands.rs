@@ -205,6 +205,38 @@ pub fn heartbeat(ctx: &Ctx, lease_id: &str) -> Result<i32> {
     Ok(0)
 }
 
+pub fn report_cost(ctx: &Ctx, lease_id: &str, tokens: u64, cost_cents: u64) -> Result<i32> {
+    let mut c = ctx.client()?;
+    let v = c.call(
+        "report_cost",
+        &serde_json::json!({ "lease_id": lease_id, "tokens": tokens, "cost_cents": cost_cents }),
+    )?;
+    ctx.out.either(&v, &ctx.out.green("✓ 成本已上报"));
+    Ok(0)
+}
+
+pub fn rollback(ctx: &Ctx, lease_id: &str) -> Result<i32> {
+    let (agent, session) = ctx.session()?;
+    let mut c = ctx.client()?;
+    let v = c.call(
+        "rollback",
+        &serde_json::json!({ "lease_id": lease_id, "agent_id": agent, "session_id": session }),
+    )?;
+    let restored = v.get("files_restored").and_then(|r| r.as_u64()).unwrap_or(0);
+    ctx.out.either(
+        &v,
+        &ctx.out.green(&format!("✓ 已回滚租约 {lease_id}，恢复了 {restored} 个文件")),
+    );
+    Ok(0)
+}
+
+pub fn list_snapshots(ctx: &Ctx) -> Result<i32> {
+    let mut c = ctx.client()?;
+    let v = c.call("snapshots", &serde_json::json!({}))?;
+    ctx.out.either(&v, &ctx.out.green("✓ 快照列表"));
+    Ok(0)
+}
+
 // ---------- status ----------
 
 pub fn status(ctx: &Ctx, free: bool) -> Result<i32> {

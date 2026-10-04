@@ -78,6 +78,24 @@ enum Command {
     },
     /// 租约心跳续约
     Heartbeat { lease_id: String },
+    /// 上报租约的 token 消耗和成本（F6 成本归因）
+    ReportCost {
+        /// 租约 ID
+        lease_id: String,
+        /// 本次消耗的 token 数
+        #[arg(long, default_value = "0")]
+        tokens: u64,
+        /// 本次消耗的成本（美分）
+        #[arg(long, default_value = "0")]
+        cost_cents: u64,
+    },
+    /// 回滚租约：恢复该租约变更的文件到租约开始时的状态（F7 隔离回滚）
+    Rollback {
+        /// 租约 ID
+        lease_id: String,
+    },
+    /// 列出所有租约快照（F7）
+    Snapshots,
     /// 列出租约 + 资源分配 + 当前强制层
     Status {
         /// 只显示无冲突的一级目录（rejection 建议 refer 的清单）
@@ -187,6 +205,13 @@ fn real_main(cli: &Cli) -> i32 {
         }
         Command::Release { lease_id, all } => commands::release(&ctx, lease_id.as_deref(), *all),
         Command::Heartbeat { lease_id } => commands::heartbeat(&ctx, lease_id),
+        Command::ReportCost {
+            lease_id,
+            tokens,
+            cost_cents,
+        } => commands::report_cost(&ctx, lease_id, *tokens, *cost_cents),
+        Command::Rollback { lease_id } => commands::rollback(&ctx, lease_id),
+        Command::Snapshots => commands::list_snapshots(&ctx),
         Command::Status { free } => commands::status(&ctx, *free),
         Command::Log { verify, since } => commands::log(&ctx, *verify, since.as_deref()),
         Command::Doctor => commands::doctor(&ctx),

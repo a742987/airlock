@@ -3,7 +3,10 @@ name = "airlock-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core library: lease engine, hash-chained audit, enforcement backends, blackboard, resource allocation"
+description = "Core library: lease engine, hash-chained audit, enforcement backends, blackboard, resource allocation, snapshot/rollback, tree-sitter prediction"
+repository.workspace = true
+keywords = ["ai", "agents", "file-leases", "coordination", "multi-agent"]
+categories = ["development-tools", "filesystem"]
 
 [dependencies]
 serde.workspace = true
@@ -12,6 +15,12 @@ libc.workspace = true
 sha2.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-go.workspace = true
 
 [[test]]
 name = "integration"

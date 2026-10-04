@@ -23,7 +23,9 @@ pub mod paths;
 pub mod predict;
 pub mod proto;
 pub mod resources;
+pub mod snapshot;
 pub mod store;
+pub mod symbols;
 
 pub use error::{Error, Result};
 pub use paths::Domain;

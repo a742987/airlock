@@ -1,15 +1,12 @@
 # Homebrew formula：brew tap airlock-dev/tap && brew install airlock
 #
-# 当前状态：首个 release tag 未发布，stable URL 尚无 sha256——
-# 现阶段可用 `brew install --HEAD airlock`（从 main 分支构建）；
-# tag 发布后填入 sha256 行，stable 安装即生效。
+# v0.5.0：包含 F5 tree-sitter 符号级冲突预测、F6 成本归因、F7 租约快照与隔离回滚。
+# 发布后填入 sha256 行（tarball 校验和）：shasum -a 256 v0.5.0.tar.gz
 class Airlock < Formula
   desc "Kernel-enforced file leases for parallel AI coding agents"
   homepage "https://github.com/airlock-dev/airlock"
-  url "https://github.com/airlock-dev/airlock/archive/refs/tags/v0.1.0.tar.gz"
-  # TODO: 首个 release tag 后填入 sha256（tarball 校验和）：
-  #   shasum -a 256 v0.1.0.tar.gz
-  # sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  url "https://github.com/airlock-dev/airlock/archive/refs/tags/v0.5.0.tar.gz"
+  # sha256 "TODO_FILL_AFTER_RELEASE"
   head "https://github.com/airlock-dev/airlock.git", branch: "main"
   license any_of: ["MIT", "Apache-2.0"]
 
@@ -28,6 +25,12 @@ class Airlock < Formula
       macOS 上 Airlock 运行于 L1 advisory（内核强制不可用属预期，非错误）。
       Linux ≥5.13（含 WSL2）上 `airlock run` 提供 L2 Landlock 真实拒绝。
       L3 BPF-LSM 为规划中：当前仅探测内核能力，不拦截。
+
+      v0.5.0 新特性：
+        - F5: tree-sitter 符号级冲突预测（claim 时识别函数/类/方法级冲突）
+        - F6: 成本归因（tower TUI 显示每个租约的 token 消耗和成本）
+        - F7: 租约快照与隔离回滚（airlock rollback <lease-id> 撤销单个 agent 的改动）
+
       快速开始：
         airlock daemon start
         airlock doctor

@@ -1,7 +1,10 @@
-# Airlock 租约协议规范 v0（draft）
+# Airlock 租约协议规范 v1
 
-> 状态：草案（v0.3 发布时随 API 稳定性承诺转正式 v1 冻结）。
+> 状态：v1.0（v0.5.0 开发中，API 稳定性承诺将在 v1.0 生效）。
 > 本文档供第三方实现（SDK / 编排框架接入）。变更走 RFC。
+>
+> v0.5.0 新增：`report_cost`（F6 成本归因）、`rollback`（F7 隔离回滚）、`snapshots`（F7 快照列表）。
+> 租约新增字段：`tokens_used`、`cost_cents`（成本归因）。
 
 ## 1. 概念
 
@@ -43,6 +46,9 @@ daemon `airlockd` 在 `<git-common-dir>/airlock/daemon.sock` 监听 **unix socke
 | `misc_lock` / `misc_unlock` | `name, session_id` | git `index.lock` 类串行化 |
 | `branch_db` | `path, session_id` | SQLite 会话副本路径 |
 | `degrade` | `path, reason` | 写入降级审计事件 |
+| `report_cost` | `lease_id, tokens?, cost_cents?` | `{report_cost:"ok"}`；上报租约的 token 消耗和成本（F6） |
+| `rollback` | `lease_id` | `{rollback:"ok", files_restored: n}`；恢复该租约变更的文件到快照锚点（F7） |
+| `snapshots` | – | 快照数组（F7） |
 | `stop` | – | 干净停机 |
 
 ## 4. 409 拒绝载荷（v1.0 冻结）

@@ -144,7 +144,7 @@ fn main() {
     {
         let s = lock_store(&daemon.store);
         let _ = s.meta_set("boot_ts", &daemon.started_at.to_string());
-        let recovered = lease::sweep_all(&s, &daemon.layer.id, &daemon.domain.dir.join("sessions"))
+        let recovered = lease::sweep_all(&s, &daemon.layer.id, &daemon.domain.dir.join("sessions"), Some(&daemon.domain.root))
             .map(|v| v.len())
             .unwrap_or(0);
         let active = s
@@ -194,6 +194,7 @@ fn main() {
         let store = Arc::clone(&daemon.store);
         let layer_id = daemon.layer.id.clone();
         let session_root = daemon.domain.dir.join("sessions");
+        let domain_root = daemon.domain.root.clone();
         std::thread::spawn(move || loop {
             // try_lock：WouldBlock（本周期跳过）与中毒（恢复继续清扫）分开处理
             let guard = match store.try_lock() {
@@ -202,7 +203,7 @@ fn main() {
                 Err(std::sync::TryLockError::WouldBlock) => None,
             };
             if let Some(s) = guard {
-                let _ = lease::sweep_all(&s, &layer_id, &session_root);
+                let _ = lease::sweep_all(&s, &layer_id, &session_root, Some(&domain_root));
                 let _ = resources::sweep_cooldowns(&s);
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -440,14 +441,14 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                         return Err(Error::Config("release 需要 session_id（属主校验）".into()));
                     }
                     let released =
-                        lease::release(&store, &lease_id, &actor, &d.layer.id, Some(&session))?;
+                        lease::release(&store, &lease_id, &actor, &d.layer.id, Some(&session), Some(&d.domain.root))?;
                     if !released {
                         return Err(Error::NotFound(format!("租约 {lease_id} 不存在或已释放")));
                     }
                     return Ok(serde_json::json!({ "released": 1 }));
                 }
                 if let Some(sid) = opt_str(p, "session_id") {
-                    let n = lease::release_all(&store, &sid, &actor, &d.layer.id)?;
+                    let n = lease::release_all(&store, &sid, &actor, &d.layer.id, Some(&d.domain.root))?;
                     return Ok(serde_json::json!({ "released": n }));
                 }
                 Err(Error::Config("release 需要 lease_id 或 session_id".into()))
@@ -471,6 +472,44 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                     return Err(Error::NotFound(format!("租约 {lease_id} 不存在或已过期")));
                 }
                 Ok(serde_json::json!({ "heartbeat": "ok" }))
+            }
+            "report_cost" => {
+                let lease_id = str_or(p, "lease_id", "");
+                let tokens = p.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let cost_cents = p.get("cost_cents").and_then(|v| v.as_u64()).unwrap_or(0);
+                if lease_id.is_empty() {
+                    return Err(Error::Config("report_cost 需要 lease_id".into()));
+                }
+                store.update_lease_cost(&lease_id, tokens, cost_cents)?;
+                Ok(serde_json::json!({ "report_cost": "ok" }))
+            }
+            "rollback" => {
+                let lease_id = str_or(p, "lease_id", "");
+                if lease_id.is_empty() {
+                    return Err(Error::Config("rollback 需要 lease_id".into()));
+                }
+                let snap_dir = d.domain.root.join(".airlock").join("snapshots");
+                let snapshot = airlock_core::snapshot::load_snapshot_from(&snap_dir, &lease_id)?;
+                match snapshot {
+                    Some(snap) => {
+                        let restored = airlock_core::snapshot::rollback_lease(&d.domain.root, &snap)?;
+                        store.audit(
+                            "rollback",
+                            &actor_from(p),
+                            &format!("lease:{lease_id}"),
+                            Some(&lease_id),
+                            &d.layer.id,
+                            Some(&serde_json::json!({ "files_restored": restored })),
+                        )?;
+                        Ok(serde_json::json!({ "rollback": "ok", "files_restored": restored }))
+                    }
+                    None => Err(Error::NotFound(format!("租约 {lease_id} 的快照不存在"))),
+                }
+            }
+            "snapshots" => {
+                let snap_dir = d.domain.root.join(".airlock").join("snapshots");
+                let snaps = airlock_core::snapshot::list_snapshots_from(&snap_dir)?;
+                Ok(serde_json::to_value(&snaps)?)
             }
             "status" => {
                 let active_only = p
@@ -545,7 +584,7 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                 let session_id = str_or(p, "session_id", "");
                 let n = resources::end_session_ports(&store, &session_id)?;
                 let actor = actor_from(p);
-                lease::release_all(&store, &session_id, &actor, &d.layer.id)?;
+                lease::release_all(&store, &session_id, &actor, &d.layer.id, Some(&d.domain.root))?;
                 for name in store.misc_locks_by_session(&session_id)? {
                     let _ = store.misc_lock_release(&name, &session_id);
                 }

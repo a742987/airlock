@@ -89,7 +89,9 @@ impl Store {
                 ttl_s INTEGER NOT NULL,
                 last_heartbeat INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
-                enforcement_layer TEXT NOT NULL DEFAULT 'L1'
+                enforcement_layer TEXT NOT NULL DEFAULT 'L1',
+                tokens_used INTEGER NOT NULL DEFAULT 0,
+                cost_cents INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_leases_state ON leases(state);
             CREATE INDEX IF NOT EXISTS idx_leases_domain ON leases(conflict_domain);
@@ -395,8 +397,8 @@ impl Store {
 
     pub fn insert_lease(&self, l: &LeaseInfo) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO leases(id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO leases(id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer, tokens_used, cost_cents)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 l.id,
                 l.conflict_domain,
@@ -409,7 +411,9 @@ impl Store {
                 l.ttl_s,
                 l.last_heartbeat,
                 l.expires_at,
-                l.enforcement_layer
+                l.enforcement_layer,
+                l.tokens_used,
+                l.cost_cents
             ],
         )?;
         Ok(())
@@ -436,6 +440,35 @@ impl Store {
         Ok(())
     }
 
+    /// F6：更新租约的 token 消耗和成本。使用饱和加法防止溢出。
+    pub fn update_lease_cost(
+        &self,
+        id: &str,
+        tokens_delta: u64,
+        cost_cents_delta: u64,
+    ) -> Result<()> {
+        // 先读取当前值
+        let current: (u64, u64) = self
+            .conn
+            .query_row(
+                "SELECT tokens_used, cost_cents FROM leases WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or((0, 0));
+
+        // 饱和加法：防止溢出回绕
+        let new_tokens = current.0.saturating_add(tokens_delta);
+        let new_cost = current.1.saturating_add(cost_cents_delta);
+
+        self.conn.execute(
+            "UPDATE leases SET tokens_used = ?2, cost_cents = ?3 WHERE id = ?1",
+            params![id, new_tokens, new_cost],
+        )?;
+        Ok(())
+    }
+
     pub fn get_lease(&self, id: &str) -> Result<Option<LeaseInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer
@@ -447,7 +480,7 @@ impl Store {
 
     /// 列出租约（domain 过滤可选；state 过滤可选；expired/release 的历史也可见）。
     pub fn list_leases(&self, domain: Option<&str>, active_only: bool) -> Result<Vec<LeaseInfo>> {
-        let mut sql = "SELECT id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer FROM leases".to_string();
+        let mut sql = "SELECT id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer, tokens_used, cost_cents FROM leases".to_string();
         let mut conds = Vec::new();
         if domain.is_some() {
             conds.push("conflict_domain = ?1".to_string());
@@ -470,7 +503,7 @@ impl Store {
 
     /// 所有 active 且未过期的租约（调用方负责先 sweep 或以 expires_at 过滤）。
     pub fn active_leases(&self, domain: Option<&str>, now_ts: i64) -> Result<Vec<LeaseInfo>> {
-        let mut sql = "SELECT id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer
+        let mut sql = "SELECT id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer, tokens_used, cost_cents
                        FROM leases WHERE state = 'active' AND expires_at > ?1".to_string();
         if domain.is_some() {
             sql.push_str(" AND conflict_domain = ?2");
@@ -792,6 +825,8 @@ fn lease_from_row_query(
                 last_heartbeat: r.get(9)?,
                 expires_at: r.get(10)?,
                 enforcement_layer: r.get(11)?,
+                tokens_used: r.get::<_, u64>(12).unwrap_or(0),
+                cost_cents: r.get::<_, u64>(13).unwrap_or(0),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

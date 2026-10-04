@@ -70,12 +70,20 @@ fn render_once(ctx: &Ctx) -> Result<i32> {
         } else {
             l.state.clone()
         };
+        let cost_str = if l.cost_cents > 0 {
+            format!("${:.2}", l.cost_cents as f64 / 100.0)
+        } else if l.tokens_used > 0 {
+            format!("{}tok", l.tokens_used)
+        } else {
+            "-".into()
+        };
         println!(
-            "  {:<10} {:<28} {:<10} intent: {}",
+            "  {:<10} {:<28} {:<10} intent: {} cost: {}",
             l.agent_id,
             l.glob,
             state,
-            l.intent.as_deref().unwrap_or("-")
+            l.intent.as_deref().unwrap_or("-"),
+            cost_str
         );
     }
     let resources: Vec<String> = s
@@ -158,7 +166,7 @@ fn render_tui(ctx: &Ctx) -> Result<i32> {
                     header[0],
                 );
 
-                // LEASES：谁持有什么、剩余 TTL、意图
+                // LEASES：谁持有什么、剩余 TTL、意图、成本
                 let rows: Vec<Row> = status
                     .as_ref()
                     .map(|s| {
@@ -170,11 +178,19 @@ fn render_tui(ctx: &Ctx) -> Result<i32> {
                                 } else {
                                     (l.state.clone(), Color::DarkGray)
                                 };
+                                let cost_str = if l.cost_cents > 0 {
+                                    format!("${:.2}", l.cost_cents as f64 / 100.0)
+                                } else if l.tokens_used > 0 {
+                                    format!("{}tok", l.tokens_used)
+                                } else {
+                                    "-".into()
+                                };
                                 Row::new(vec![
                                     l.agent_id.clone(),
                                     l.glob.clone(),
                                     state,
                                     l.intent.clone().unwrap_or_else(|| "-".into()),
+                                    cost_str,
                                 ])
                                 .style(Style::default().fg(color))
                             })
@@ -186,12 +202,13 @@ fn render_tui(ctx: &Ctx) -> Result<i32> {
                         rows,
                         [
                             Constraint::Length(12),
-                            Constraint::Percentage(45),
+                            Constraint::Percentage(40),
                             Constraint::Length(12),
-                            Constraint::Min(10),
+                            Constraint::Percentage(30),
+                            Constraint::Length(10),
                         ],
                     )
-                    .header(Row::new(vec!["AGENT", "GLOB", "TTL", "INTENT"]).bold())
+                    .header(Row::new(vec!["AGENT", "GLOB", "TTL", "INTENT", "COST"]).bold())
                     .block(Block::default().borders(Borders::ALL).title("LEASES")),
                     header[1],
                 );

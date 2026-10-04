@@ -148,6 +148,11 @@ fn tools_list() -> serde_json::Value {
             tool("heartbeat", "租约心跳续约", obj(serde_json::json!({
                 "lease_id": { "type": "string" }
             }), &["lease_id"])),
+            tool("report_cost", "上报租约的 token 消耗和成本（F6 成本归因）", obj(serde_json::json!({
+                "lease_id": { "type": "string" },
+                "tokens": { "type": "integer" },
+                "cost_cents": { "type": "integer" }
+            }), &["lease_id"])),
             tool("status", "查看租约表、资源分配与当前强制层", obj(serde_json::json!({}), &[])),
             tool("log", "审计日志（可选校验 hash 链）", obj(serde_json::json!({
                 "verify": { "type": "boolean" }, "limit": { "type": "integer" }
@@ -271,6 +276,18 @@ fn tool_call(
             c.call(
                 "heartbeat",
                 &serde_json::json!({ "lease_id": id, "session_id": sid }),
+            )?
+        }
+        "report_cost" => {
+            let id = args
+                .get("lease_id")
+                .and_then(|i| i.as_str())
+                .ok_or_else(|| Error::Config("report_cost 需要 lease_id".into()))?;
+            let tokens = args.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cost_cents = args.get("cost_cents").and_then(|v| v.as_u64()).unwrap_or(0);
+            c.call(
+                "report_cost",
+                &serde_json::json!({ "lease_id": id, "tokens": tokens, "cost_cents": cost_cents }),
             )?
         }
         "status" => {

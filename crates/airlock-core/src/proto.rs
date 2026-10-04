@@ -53,6 +53,12 @@ pub struct LeaseInfo {
     pub expires_at: i64,
     /// 下发时的层（L1/L2/L3），用于空窗审计
     pub enforcement_layer: String,
+    /// F6：累计 token 消耗（由 agent 通过 heartbeat 或 report_cost 上报）
+    #[serde(default)]
+    pub tokens_used: u64,
+    /// F6：累计成本（美分，由 tokens_used × 单价估算）
+    #[serde(default)]
+    pub cost_cents: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
