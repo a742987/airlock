@@ -71,11 +71,7 @@ fn chaos_1000_concurrent_claims_non_overlapping() {
     // 验证：审计链完整
     let s = store.lock().unwrap();
     let broken = s.audit_verify().unwrap();
-    assert!(
-        broken.is_empty(),
-        "审计链存在断链位置: {:?}",
-        broken
-    );
+    assert!(broken.is_empty(), "审计链存在断链位置: {:?}", broken);
 }
 
 #[test]
@@ -134,7 +130,7 @@ fn chaos_1000_concurrent_claims_with_conflicts() {
     // 验证：大约 100 个成功（每个文件一个）
     let success_count = results.iter().filter(|r| r.is_ok()).count();
     assert!(
-        success_count >= 95 && success_count <= 105,
+        (95..=105).contains(&success_count),
         "预期约 100 个成功 claim，实际 {}",
         success_count
     );
@@ -142,20 +138,13 @@ fn chaos_1000_concurrent_claims_with_conflicts() {
     // 验证：审计链完整
     let s = store.lock().unwrap();
     let broken = s.audit_verify().unwrap();
-    assert!(
-        broken.is_empty(),
-        "审计链存在断链位置: {:?}",
-        broken
-    );
+    assert!(broken.is_empty(), "审计链存在断链位置: {:?}", broken);
 
     // 验证：所有拒绝都有 deny 审计记录
     let audit = s.audit_query(None, 10000).unwrap();
     let deny_count = audit.iter().filter(|e| e.event == "deny").count();
     let conflict_count = results.iter().filter(|r| r.is_err()).count();
-    assert!(
-        deny_count > 0,
-        "应该有 deny 审计记录，但实际为 0"
-    );
+    assert!(deny_count > 0, "应该有 deny 审计记录，但实际为 0");
     println!(
         "混沌测试统计: {} 次成功, {} 次冲突, {} 条 deny 审计",
         success_count, conflict_count, deny_count
@@ -174,7 +163,8 @@ fn chaos_concurrent_claim_and_release() {
     {
         let s = store.lock().unwrap();
         for i in 500..1000 {
-            let params = make_claim_params(&format!("sess-{}", i), &format!("src/pre-{}.rs", i), "L1");
+            let params =
+                make_claim_params(&format!("sess-{}", i), &format!("src/pre-{}.rs", i), "L1");
             let _ = lease::claim(&s, &cfg, &params);
         }
     }
@@ -197,9 +187,13 @@ fn chaos_concurrent_claim_and_release() {
         // claim 线程
         let handle = thread::spawn(move || {
             barrier.wait();
-            let params = make_claim_params(&format!("new-sess-{}", i), &format!("src/new-{}.rs", i), "L1");
+            let params = make_claim_params(
+                &format!("new-sess-{}", i),
+                &format!("src/new-{}.rs", i),
+                "L1",
+            );
             let s = store.lock().unwrap();
-            lease::claim(&s, &cfg, &params)
+            let _ = lease::claim(&s, &cfg, &params);
         });
         handles.push(handle);
     }
@@ -214,9 +208,18 @@ fn chaos_concurrent_claim_and_release() {
             barrier.wait();
             if let Some(lid) = lease_id {
                 let s = store.lock().unwrap();
-                lease::release(&s, &lid, "L1")
-            } else {
-                Ok(())
+                let _ = lease::release(
+                    &s,
+                    &lid,
+                    &Actor {
+                        agent: "test-agent".into(),
+                        session: "unknown".into(),
+                        pid_tree: vec![],
+                    },
+                    "L1",
+                    None,
+                    None,
+                );
             }
         });
         handles.push(handle);
@@ -230,20 +233,12 @@ fn chaos_concurrent_claim_and_release() {
     // 验证：审计链完整
     let s = store.lock().unwrap();
     let broken = s.audit_verify().unwrap();
-    assert!(
-        broken.is_empty(),
-        "审计链存在断链位置: {:?}",
-        broken
-    );
+    assert!(broken.is_empty(), "审计链存在断链位置: {:?}", broken);
 
     // 验证：active 租约数合理
     let active = s.list_leases(Some("test-domain"), true).unwrap();
     println!("混沌测试后 active 租约数: {}", active.len());
-    assert!(
-        active.len() <= 1000,
-        "active 租约数异常: {}",
-        active.len()
-    );
+    assert!(active.len() <= 1000, "active 租约数异常: {}", active.len());
 }
 
 #[test]
@@ -267,9 +262,5 @@ fn chaos_stress_audit_chain() {
 
     // 验证审计记录数量
     let audit = store.audit_query(None, 20000).unwrap();
-    assert!(
-        audit.len() >= 10000,
-        "审计记录数不足: {}",
-        audit.len()
-    );
+    assert!(audit.len() >= 10000, "审计记录数不足: {}", audit.len());
 }

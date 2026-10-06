@@ -407,7 +407,12 @@ fn ts_display(ts: i64) -> String {
 }
 
 /// 守护进程周期任务：过期清扫 + 黑板 7 天归档保留 + 已结束会话资源清理。
-pub fn sweep_all(store: &Store, layer: &str, session_root: &Path, root: Option<&Path>) -> Result<Vec<LeaseInfo>> {
+pub fn sweep_all(
+    store: &Store,
+    layer: &str,
+    session_root: &Path,
+    root: Option<&Path>,
+) -> Result<Vec<LeaseInfo>> {
     let expired = sweep(store, layer, root)?;
     store.board_purge(7)?;
     // AC3.3：会话结束 60s 内销毁临时资源

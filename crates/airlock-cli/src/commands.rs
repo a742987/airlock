@@ -222,10 +222,15 @@ pub fn rollback(ctx: &Ctx, lease_id: &str) -> Result<i32> {
         "rollback",
         &serde_json::json!({ "lease_id": lease_id, "agent_id": agent, "session_id": session }),
     )?;
-    let restored = v.get("files_restored").and_then(|r| r.as_u64()).unwrap_or(0);
+    let restored = v
+        .get("files_restored")
+        .and_then(|r| r.as_u64())
+        .unwrap_or(0);
     ctx.out.either(
         &v,
-        &ctx.out.green(&format!("✓ 已回滚租约 {lease_id}，恢复了 {restored} 个文件")),
+        &ctx.out.green(&format!(
+            "✓ 已回滚租约 {lease_id}，恢复了 {restored} 个文件"
+        )),
     );
     Ok(0)
 }

@@ -4,7 +4,8 @@
 //! 资源分配、黑板维护、过期清扫、保护空窗追踪（AC2.4）。
 //! SQLite 损坏时拒绝启动（§8.4：宁可不可用，不可假保护）。
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -45,6 +46,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut root: Option<PathBuf> = None;
     let mut foreground = false;
+    let mut listen_addr: Option<String> = None;
     let mut config_path: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -56,6 +58,13 @@ fn main() {
                 }
             },
             "--foreground" => foreground = true,
+            "--listen" => match args.next() {
+                Some(v) => listen_addr = Some(v),
+                None => {
+                    eprintln!("--listen 需要值；用法: airlockd [--listen <addr>]");
+                    std::process::exit(5);
+                }
+            },
             "--config" => match args.next() {
                 Some(v) => config_path = Some(PathBuf::from(v)),
                 None => {
@@ -88,13 +97,16 @@ fn main() {
             std::process::exit(5);
         }
     };
-    let cfg = match Config::load(config_path.as_deref(), &domain.root) {
+    let mut cfg = match Config::load(config_path.as_deref(), &domain.root) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(5);
         }
     };
+    if listen_addr.is_some() {
+        cfg.listen_addr = listen_addr;
+    }
 
     // SQLite 损坏 → 拒绝启动（§8.4），错误信息含修复指引（messages::SQLITE_CORRUPT）
     let store = match Store::open(&domain.db_path()) {
@@ -136,6 +148,22 @@ fn main() {
         return;
     }
 
+    // TCP 复用完整的特权协议，只允许绑定回环地址。跨机监听没有认证层，
+    // 因此必须在 daemonize 和 Unix socket 创建前拒绝非本机暴露。
+    let tcp_listener = match daemon.cfg.listen_addr.as_deref() {
+        Some(addr) => match bind_local_tcp_listener(addr) {
+            Ok(listener) => {
+                eprintln!("airlockd TCP protocol listening on {addr} (loopback only)");
+                Some(listener)
+            }
+            Err(e) => {
+                eprintln!("拒绝 TCP 监听 {addr}: {e}");
+                std::process::exit(5);
+            }
+        },
+        None => None,
+    };
+
     if !foreground {
         daemonize(&daemon.domain);
     }
@@ -144,9 +172,14 @@ fn main() {
     {
         let s = lock_store(&daemon.store);
         let _ = s.meta_set("boot_ts", &daemon.started_at.to_string());
-        let recovered = lease::sweep_all(&s, &daemon.layer.id, &daemon.domain.dir.join("sessions"), Some(&daemon.domain.root))
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let recovered = lease::sweep_all(
+            &s,
+            &daemon.layer.id,
+            &daemon.domain.dir.join("sessions"),
+            Some(&daemon.domain.root),
+        )
+        .map(|v| v.len())
+        .unwrap_or(0);
         let active = s
             .active_leases(Some(&daemon.domain.id), now())
             .map(|v| v.len())
@@ -219,6 +252,45 @@ fn main() {
             std::process::exit(5);
         }
     };
+    // Optional local TCP transport. The wire format is the same versioned
+    // NDJSON protocol as the Unix socket; bind_local_tcp_listener enforces
+    // loopback-only access because this protocol has no authentication layer.
+    if let Some(tcp) = tcp_listener {
+        let _ = tcp.set_nonblocking(true);
+        let d = Daemon {
+            store: Arc::clone(&daemon.store),
+            domain: daemon.domain.clone(),
+            cfg: daemon.cfg.clone(),
+            layer: daemon.layer.clone(),
+            protection_gap_s: daemon.protection_gap_s,
+            started_at: daemon.started_at,
+        };
+        std::thread::spawn(move || {
+            while !SHUTDOWN.load(Ordering::SeqCst) {
+                match tcp.accept() {
+                    Ok((s, _)) => {
+                        let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+                        let _ = s.set_write_timeout(Some(Duration::from_secs(30)));
+                        let d = Daemon {
+                            store: Arc::clone(&d.store),
+                            domain: d.domain.clone(),
+                            cfg: d.cfg.clone(),
+                            layer: d.layer.clone(),
+                            protection_gap_s: d.protection_gap_s,
+                            started_at: d.started_at,
+                        };
+                        std::thread::spawn(move || {
+                            let _ = handle_conn(s, &d);
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
     // 写 pid 文件
     if let Err(e) = std::fs::write(daemon.domain.pid_path(), std::process::id().to_string()) {
         eprintln!(
@@ -245,6 +317,8 @@ fn main() {
         match listener.accept() {
             Ok((s, _)) => {
                 let _ = s.set_nonblocking(false);
+                let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+                let _ = s.set_write_timeout(Some(Duration::from_secs(30)));
                 let d = Daemon {
                     store: Arc::clone(&daemon.store),
                     domain: daemon.domain.clone(),
@@ -266,6 +340,23 @@ fn main() {
     let _ = std::fs::remove_file(daemon.domain.pid_path());
     let s = lock_store(&daemon.store);
     let _ = s.mark_clean_shutdown();
+}
+
+fn bind_local_tcp_listener(addr: &str) -> io::Result<TcpListener> {
+    let listener = TcpListener::bind(addr)?;
+    let bound = listener.local_addr()?;
+    validate_local_tcp_addr(bound)?;
+    Ok(listener)
+}
+
+fn validate_local_tcp_addr(bound: SocketAddr) -> io::Result<()> {
+    if bound.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("监听地址必须是回环地址（实际绑定为 {bound}）"),
+    ))
 }
 
 fn daemonize(domain: &Domain) {
@@ -293,10 +384,26 @@ fn daemonize(domain: &Domain) {
     }
 }
 
-fn handle_conn(stream: UnixStream, d: &Daemon) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
+trait ProtocolStream: Read + Write {
+    fn clone_stream(&self) -> std::io::Result<Self>
+    where
+        Self: Sized;
+}
+
+impl ProtocolStream for UnixStream {
+    fn clone_stream(&self) -> std::io::Result<Self> {
+        self.try_clone()
+    }
+}
+
+impl ProtocolStream for std::net::TcpStream {
+    fn clone_stream(&self) -> std::io::Result<Self> {
+        self.try_clone()
+    }
+}
+
+fn handle_conn<S: ProtocolStream>(stream: S, d: &Daemon) -> Result<()> {
+    let mut reader = BufReader::new(stream.clone_stream()?);
     let mut w = stream;
     // 循环服务直到客户端 EOF——客户端在同一连接上发多个请求是合法用法
     // （P2-4：以前「一连接一请求」让复用方的第二次 write 撞 EPIPE）
@@ -440,15 +547,27 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                     if session.is_empty() {
                         return Err(Error::Config("release 需要 session_id（属主校验）".into()));
                     }
-                    let released =
-                        lease::release(&store, &lease_id, &actor, &d.layer.id, Some(&session), Some(&d.domain.root))?;
+                    let released = lease::release(
+                        &store,
+                        &lease_id,
+                        &actor,
+                        &d.layer.id,
+                        Some(&session),
+                        Some(&d.domain.root),
+                    )?;
                     if !released {
                         return Err(Error::NotFound(format!("租约 {lease_id} 不存在或已释放")));
                     }
                     return Ok(serde_json::json!({ "released": 1 }));
                 }
                 if let Some(sid) = opt_str(p, "session_id") {
-                    let n = lease::release_all(&store, &sid, &actor, &d.layer.id, Some(&d.domain.root))?;
+                    let n = lease::release_all(
+                        &store,
+                        &sid,
+                        &actor,
+                        &d.layer.id,
+                        Some(&d.domain.root),
+                    )?;
                     return Ok(serde_json::json!({ "released": n }));
                 }
                 Err(Error::Config("release 需要 lease_id 或 session_id".into()))
@@ -492,7 +611,8 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                 let snapshot = airlock_core::snapshot::load_snapshot_from(&snap_dir, &lease_id)?;
                 match snapshot {
                     Some(snap) => {
-                        let restored = airlock_core::snapshot::rollback_lease(&d.domain.root, &snap)?;
+                        let restored =
+                            airlock_core::snapshot::rollback_lease(&d.domain.root, &snap)?;
                         store.audit(
                             "rollback",
                             &actor_from(p),
@@ -584,7 +704,13 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                 let session_id = str_or(p, "session_id", "");
                 let n = resources::end_session_ports(&store, &session_id)?;
                 let actor = actor_from(p);
-                lease::release_all(&store, &session_id, &actor, &d.layer.id, Some(&d.domain.root))?;
+                lease::release_all(
+                    &store,
+                    &session_id,
+                    &actor,
+                    &d.layer.id,
+                    Some(&d.domain.root),
+                )?;
                 for name in store.misc_locks_by_session(&session_id)? {
                     let _ = store.misc_lock_release(&name, &session_id);
                 }
@@ -673,5 +799,20 @@ fn actor_from(p: &serde_json::Value) -> Actor {
             .get("pid_tree")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::validate_local_tcp_addr;
+
+    #[test]
+    fn tcp_listener_allows_loopback_only() {
+        assert!(validate_local_tcp_addr("127.0.0.1:9418".parse::<SocketAddr>().unwrap()).is_ok());
+        assert!(validate_local_tcp_addr("[::1]:9418".parse::<SocketAddr>().unwrap()).is_ok());
+        assert!(validate_local_tcp_addr("0.0.0.0:9418".parse::<SocketAddr>().unwrap()).is_err());
+        assert!(validate_local_tcp_addr("[::]:9418".parse::<SocketAddr>().unwrap()).is_err());
     }
 }

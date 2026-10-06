@@ -1,4 +1,4 @@
-# Airlock — One repo. Many agents. Zero collisions.
+# Airlock v1.0.0 — One repo. Many agents. Zero collisions.
 
 ## 一键安装
 

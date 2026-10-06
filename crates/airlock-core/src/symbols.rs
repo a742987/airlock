@@ -115,21 +115,13 @@ fn collect_symbols(node: &tree_sitter::Node, source: &[u8], out: &mut Vec<Symbol
 fn extract_name(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     for field_name in ["name", "name_field"] {
         if let Some(name_node) = node.child_by_field_name(field_name) {
-            return Some(
-                name_node
-                    .utf8_text(source)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string(),
-            );
+            return Some(name_node.utf8_text(source).unwrap_or("").trim().to_string());
         }
     }
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             if child.kind() == "identifier" || child.kind() == "type_identifier" {
-                return Some(
-                    child.utf8_text(source).unwrap_or("").trim().to_string(),
-                );
+                return Some(child.utf8_text(source).unwrap_or("").trim().to_string());
             }
         }
     }
@@ -168,9 +160,15 @@ fn world() {}
 struct Foo {}
 "#;
         let syms = extract_symbols(Path::new("test.rs"), source);
-        assert!(syms.iter().any(|s| s.name == "hello" && s.kind == SymbolKind::Function));
-        assert!(syms.iter().any(|s| s.name == "world" && s.kind == SymbolKind::Function));
-        assert!(syms.iter().any(|s| s.name == "Foo" && s.kind == SymbolKind::Class));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "hello" && s.kind == SymbolKind::Function));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "world" && s.kind == SymbolKind::Function));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "Foo" && s.kind == SymbolKind::Class));
     }
 
     #[test]
@@ -182,9 +180,15 @@ class Foo {
 function baz() {}
 "#;
         let syms = extract_symbols(Path::new("test.ts"), source);
-        assert!(syms.iter().any(|s| s.name == "Foo" && s.kind == SymbolKind::Class));
-        assert!(syms.iter().any(|s| s.name == "bar" && s.kind == SymbolKind::Method));
-        assert!(syms.iter().any(|s| s.name == "baz" && s.kind == SymbolKind::Function));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "Foo" && s.kind == SymbolKind::Class));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "bar" && s.kind == SymbolKind::Method));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "baz" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -198,8 +202,12 @@ class World:
         pass
 "#;
         let syms = extract_symbols(Path::new("test.py"), source);
-        assert!(syms.iter().any(|s| s.name == "hello" && s.kind == SymbolKind::Function));
-        assert!(syms.iter().any(|s| s.name == "World" && s.kind == SymbolKind::Class));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "hello" && s.kind == SymbolKind::Function));
+        assert!(syms
+            .iter()
+            .any(|s| s.name == "World" && s.kind == SymbolKind::Class));
     }
 
     #[test]

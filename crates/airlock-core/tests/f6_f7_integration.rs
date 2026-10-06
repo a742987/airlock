@@ -7,7 +7,31 @@ use airlock_core::snapshot;
 use airlock_core::store::Store;
 use std::fs;
 use std::process::Command;
-use tempfile::TempDir;
+struct TempDir {
+    path: std::path::PathBuf,
+}
+
+impl TempDir {
+    fn new() -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "airlock-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
 
 /// 创建测试用的 ClaimParams
 fn make_test_claim(session_id: &str, glob: &str) -> ClaimParams {
@@ -113,15 +137,35 @@ fn test_f7_snapshot_lifecycle() {
     let repo = temp.path();
 
     // 初始化 git 仓库
-    Command::new("git").args(["init"]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["config", "user.name", "test"]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(repo).output().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "test"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
 
     // 创建初始文件并提交
     fs::write(repo.join("file1.txt"), "initial content").unwrap();
     fs::write(repo.join("file2.txt"), "another file").unwrap();
-    Command::new("git").args(["add", "."]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["commit", "-m", "init"]).current_dir(repo).output().unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
 
     // 创建快照
     let lease_id = "test-lease-123";
@@ -136,21 +180,35 @@ fn test_f7_snapshot_lifecycle() {
     fs::remove_file(repo.join("file2.txt")).unwrap();
 
     // 完成快照（记录变更）
-    let mut snap = snapshot::load_snapshot_from(&snap_dir, lease_id).unwrap().unwrap();
+    let mut snap = snapshot::load_snapshot_from(&snap_dir, lease_id)
+        .unwrap()
+        .unwrap();
     snapshot::finalize_snapshot(repo, &mut snap).unwrap();
     snapshot::save_snapshot_to(&snap_dir, &snap).unwrap();
 
     // 验证变更文件列表
-    assert!(snap.changed_files.contains(&"file1.txt".to_string()), "应该记录 file1.txt");
-    assert!(snap.changed_files.contains(&"file2.txt".to_string()), "应该记录 file2.txt");
-    assert!(snap.changed_files.contains(&"file3.txt".to_string()), "应该记录 file3.txt");
+    assert!(
+        snap.changed_files.contains(&"file1.txt".to_string()),
+        "应该记录 file1.txt"
+    );
+    assert!(
+        snap.changed_files.contains(&"file2.txt".to_string()),
+        "应该记录 file2.txt"
+    );
+    assert!(
+        snap.changed_files.contains(&"file3.txt".to_string()),
+        "应该记录 file3.txt"
+    );
 
     // 回滚
     let n = snapshot::rollback_lease(repo, &snap).unwrap();
     assert_eq!(n, snap.changed_files.len(), "回滚文件数应匹配");
 
     // 验证文件已恢复
-    assert_eq!(fs::read_to_string(repo.join("file1.txt")).unwrap(), "initial content");
+    assert_eq!(
+        fs::read_to_string(repo.join("file1.txt")).unwrap(),
+        "initial content"
+    );
     assert!(repo.join("file2.txt").exists(), "file2.txt 应该恢复");
     assert!(!repo.join("file3.txt").exists(), "file3.txt 应该被删除");
 }
@@ -161,13 +219,33 @@ fn test_f7_snapshot_no_changes() {
     let repo = temp.path();
 
     // 初始化 git 仓库
-    Command::new("git").args(["init"]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["config", "user.name", "test"]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(repo).output().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "test"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
 
     fs::write(repo.join("file.txt"), "content").unwrap();
-    Command::new("git").args(["add", "."]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["commit", "-m", "init"]).current_dir(repo).output().unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
 
     // 创建快照
     let lease_id = "test-lease-456";
@@ -177,7 +255,9 @@ fn test_f7_snapshot_no_changes() {
     snapshot::save_snapshot_to(&snap_dir, &snap).unwrap();
 
     // 不做任何修改，直接完成快照
-    let mut snap = snapshot::load_snapshot_from(&snap_dir, lease_id).unwrap().unwrap();
+    let mut snap = snapshot::load_snapshot_from(&snap_dir, lease_id)
+        .unwrap()
+        .unwrap();
     snapshot::finalize_snapshot(repo, &mut snap).unwrap();
 
     // 验证没有变更
@@ -194,13 +274,33 @@ fn test_f7_snapshot_multiple_leases() {
     let repo = temp.path();
 
     // 初始化 git 仓库
-    Command::new("git").args(["init"]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["config", "user.name", "test"]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["config", "user.email", "test@test.com"]).current_dir(repo).output().unwrap();
+    Command::new("git")
+        .args(["init"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "test"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
 
     fs::write(repo.join("shared.txt"), "initial").unwrap();
-    Command::new("git").args(["add", "."]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["commit", "-m", "init"]).current_dir(repo).output().unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
 
     let snap_dir = repo.join(".airlock").join("snapshots");
     fs::create_dir_all(&snap_dir).unwrap();
@@ -212,10 +312,20 @@ fn test_f7_snapshot_multiple_leases() {
 
     // 租约 A 修改文件
     fs::write(repo.join("shared.txt"), "modified by A").unwrap();
-    Command::new("git").args(["add", "."]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["commit", "-m", "A changes"]).current_dir(repo).output().unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "A changes"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
 
-    let mut snap_a = snapshot::load_snapshot_from(&snap_dir, lease_a).unwrap().unwrap();
+    let mut snap_a = snapshot::load_snapshot_from(&snap_dir, lease_a)
+        .unwrap()
+        .unwrap();
     snapshot::finalize_snapshot(repo, &mut snap_a).unwrap();
     snapshot::save_snapshot_to(&snap_dir, &snap_a).unwrap();
 
@@ -226,20 +336,36 @@ fn test_f7_snapshot_multiple_leases() {
 
     // 租约 B 修改文件
     fs::write(repo.join("shared.txt"), "modified by B").unwrap();
-    Command::new("git").args(["add", "."]).current_dir(repo).output().unwrap();
-    Command::new("git").args(["commit", "-m", "B changes"]).current_dir(repo).output().unwrap();
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "B changes"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
 
-    let mut snap_b = snapshot::load_snapshot_from(&snap_dir, lease_b).unwrap().unwrap();
+    let mut snap_b = snapshot::load_snapshot_from(&snap_dir, lease_b)
+        .unwrap()
+        .unwrap();
     snapshot::finalize_snapshot(repo, &mut snap_b).unwrap();
     snapshot::save_snapshot_to(&snap_dir, &snap_b).unwrap();
 
     // 回滚租约 B（应该恢复到 "modified by A"）
     snapshot::rollback_lease(repo, &snap_b).unwrap();
-    assert_eq!(fs::read_to_string(repo.join("shared.txt")).unwrap(), "modified by A");
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).unwrap(),
+        "modified by A"
+    );
 
     // 回滚租约 A（应该恢复到 "initial"）
     snapshot::rollback_lease(repo, &snap_a).unwrap();
-    assert_eq!(fs::read_to_string(repo.join("shared.txt")).unwrap(), "initial");
+    assert_eq!(
+        fs::read_to_string(repo.join("shared.txt")).unwrap(),
+        "initial"
+    );
 }
 
 #[test]

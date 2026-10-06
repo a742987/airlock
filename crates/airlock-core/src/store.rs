@@ -471,7 +471,7 @@ impl Store {
 
     pub fn get_lease(&self, id: &str) -> Result<Option<LeaseInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer
+            "SELECT id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer, tokens_used, cost_cents
              FROM leases WHERE id = ?1",
         )?;
         let v = lease_from_row_query(&mut stmt, params![id])?;
@@ -520,7 +520,7 @@ impl Store {
     /// 到期未释放的租约（sweeper 用）。
     pub fn leases_to_expire(&self, now_ts: i64) -> Result<Vec<LeaseInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer
+            "SELECT id, conflict_domain, agent_id, session_id, glob, intent, state, issued_at, ttl_s, last_heartbeat, expires_at, enforcement_layer, tokens_used, cost_cents
              FROM leases WHERE state = 'active' AND expires_at <= ?1",
         )?;
         lease_from_row_query(&mut stmt, params![now_ts])

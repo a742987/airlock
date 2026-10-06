@@ -22,6 +22,8 @@ pub struct Config {
     pub board_token_budget: usize,
     /// 遥测：默认 false（遥测纪律：默认零采集）
     pub telemetry: bool,
+    /// Optional loopback-only TCP listener for local protocol clients. Disabled by default.
+    pub listen_addr: Option<String>,
 }
 
 impl Default for Config {
@@ -33,6 +35,7 @@ impl Default for Config {
             port_base: 30000,
             board_token_budget: 500,
             telemetry: false,
+            listen_addr: None,
         }
     }
 }
@@ -134,9 +137,16 @@ impl Config {
                 "telemetry" => {
                     self.telemetry = matches!(v.as_str(), "true" | "1" | "yes");
                 }
+                "listen_addr" => {
+                    let addr = v.trim();
+                    if addr.is_empty() {
+                        return Err(Error::Config(format!("listen_addr 不能为空（来自 {from}）")));
+                    }
+                    self.listen_addr = Some(addr.to_string());
+                }
                 other => {
                     return Err(Error::Config(format!(
-                        "未知配置键 `{other}`（来自 {from}）；合法键：enforcement/heartbeat_s/default_ttl_s/port_base/board_token_budget/telemetry"
+                        "未知配置键 `{other}`（来自 {from}）；合法键：enforcement/heartbeat_s/default_ttl_s/port_base/board_token_budget/telemetry/listen_addr"
                     )))
                 }
             }

@@ -269,6 +269,10 @@ cargo fmt --check
 - 更多语言支持（F5）
 
 ### v1.0.0（GA）
+- 发布版本统一为 `1.0.0`，冻结租约协议 v1、CLI 退出码和 MCP 接口。
+- 新增可选本机 TCP/NDJSON 传输（`airlockd --listen` 或 `listen_addr`），默认关闭，
+  仅允许回环地址，并与本地 Unix socket 使用同一请求/响应格式。
+- 修复测试与运行时 API 漂移，支持离线构建验证。
 - L3 BPF-LSM 实现
 - 生产级监控
 - API 稳定性保证
@@ -298,6 +302,6 @@ Apache-2.0
 
 ---
 
-**感谢使用 Airlock v0.5.0！**
+**感谢使用 Airlock v1.0.0！**
 
 如有问题或建议，请提交 GitHub Issue 或联系维护团队。

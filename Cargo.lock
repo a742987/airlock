@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "airlock-cli"
-version = "0.5.0"
+version = "1.0.0"
 dependencies = [
  "airlock-core",
  "clap",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "airlock-core"
-version = "0.5.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "rusqlite",
@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "airlockd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "airlock-core",
  "libc",

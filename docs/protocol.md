@@ -1,6 +1,6 @@
 # Airlock 租约协议规范 v1
 
-> 状态：v1.0（v0.5.0 开发中，API 稳定性承诺将在 v1.0 生效）。
+> 状态：v1.0（Airlock v1.0.0）。协议字段、方法和退出码自此版本冻结，变更走 RFC。
 > 本文档供第三方实现（SDK / 编排框架接入）。变更走 RFC。
 >
 > v0.5.0 新增：`report_cost`（F6 成本归因）、`rollback`（F7 隔离回滚）、`snapshots`（F7 快照列表）。
@@ -25,6 +25,10 @@ daemon `airlockd` 在 `<git-common-dir>/airlock/daemon.sock` 监听 **unix socke
 ```
 
 `v` 是协议版本（当前 1）。未知方法返回 `not_found` 错误。
+
+如需本机 TCP 客户端，可在 `airlock.toml` 设置 `listen_addr = "127.0.0.1:9418"`，
+或启动 `airlockd --listen <addr>`。TCP 监听复用同一 NDJSON 协议和 `v=1` 版本字段；
+daemon 默认关闭 TCP，并拒绝绑定非回环地址。协议没有认证或传输加密层，不能用于跨机暴露。
 
 ## 3. 方法
 

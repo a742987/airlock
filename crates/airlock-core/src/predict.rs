@@ -78,7 +78,9 @@ where
                     for sym in &candidate_syms {
                         all_involved_symbols.push(format!(
                             "{}:{}({})",
-                            file_path, sym.name, sym.kind.as_str()
+                            file_path,
+                            sym.name,
+                            sym.kind.as_str()
                         ));
                     }
                 }
@@ -207,12 +209,9 @@ mod tests {
     #[test]
     fn symbol_conflict_with_file_reader() {
         let actives = vec![lease("l1", "src/**")];
-        let files: HashMap<&str, &str> = [(
-            "src/auth.rs",
-            "pub fn login() {}\npub fn logout() {}",
-        )]
-        .into_iter()
-        .collect();
+        let files: HashMap<&str, &str> = [("src/auth.rs", "pub fn login() {}\npub fn logout() {}")]
+            .into_iter()
+            .collect();
         let reader = |p: &Path| files.get(p.to_str()?).copied().map(String::from);
         let overlapping = vec!["src/auth.rs".to_string()];
         let p = predict(&actives, "src/auth.rs", &overlapping, Some(reader));

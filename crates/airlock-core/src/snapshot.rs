@@ -25,7 +25,7 @@ pub fn git_head_commit(repo_root: &Path) -> Result<String> {
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_root)
         .output()
-        .map_err(|e| Error::Io(e))?;
+        .map_err(Error::Io)?;
     if !output.status.success() {
         return Err(Error::Other(format!(
             "git rev-parse HEAD 失败: {}",
@@ -41,7 +41,7 @@ pub fn git_current_branch(repo_root: &Path) -> Result<String> {
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(repo_root)
         .output()
-        .map_err(|e| Error::Io(e))?;
+        .map_err(Error::Io)?;
     if !output.status.success() {
         return Err(Error::Other(format!(
             "git rev-parse --abbrev-ref HEAD 失败: {}",
@@ -57,14 +57,14 @@ pub fn git_changed_files_since(repo_root: &Path, since_commit: &str) -> Result<V
         .args(["diff", "--name-only", since_commit, "HEAD"])
         .current_dir(repo_root)
         .output()
-        .map_err(|e| Error::Io(e))?;
+        .map_err(Error::Io)?;
     if !output.status.success() {
         // 如果 HEAD 不存在（例如没有新提交），尝试对比工作区
         let output = Command::new("git")
             .args(["diff", "--name-only", since_commit])
             .current_dir(repo_root)
             .output()
-            .map_err(|e| Error::Io(e))?;
+            .map_err(Error::Io)?;
         if !output.status.success() {
             return Err(Error::Other(format!(
                 "git diff 失败: {}",
@@ -74,7 +74,7 @@ pub fn git_changed_files_since(repo_root: &Path, since_commit: &str) -> Result<V
     }
     let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && *l != ".airlock" && !l.starts_with(".airlock/"))
         .map(|l| l.to_string())
         .collect();
     Ok(files)
@@ -86,7 +86,7 @@ pub fn git_working_dir_changes(repo_root: &Path) -> Result<Vec<String>> {
         .args(["status", "--porcelain"])
         .current_dir(repo_root)
         .output()
-        .map_err(|e| Error::Io(e))?;
+        .map_err(Error::Io)?;
     if !output.status.success() {
         return Err(Error::Other(format!(
             "git status 失败: {}",
@@ -96,10 +96,16 @@ pub fn git_working_dir_changes(repo_root: &Path) -> Result<Vec<String>> {
     let files: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter_map(|line| {
-            // porcelain 格式: XY filename
-            let parts: Vec<&str> = line.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                Some(parts[1].trim().to_string())
+            // Porcelain format is two status bytes followed by a space and path.
+            if line.len() >= 4 {
+                let path = line[3..].trim();
+                // Snapshot metadata is Airlock's bookkeeping and must not be
+                // treated as an agent workspace change.
+                if path == ".airlock" || path.starts_with(".airlock/") {
+                    None
+                } else {
+                    Some(path.to_string())
+                }
             } else {
                 None
             }
@@ -117,18 +123,35 @@ pub fn git_restore_files_to_commit(
     if files.is_empty() {
         return Ok(());
     }
-    // 使用 git checkout 恢复文件到指定 commit 的状态
-    let mut cmd = Command::new("git");
-    cmd.args(["checkout", commit_hash, "--"]);
     for f in files {
-        cmd.arg(f);
-    }
-    let output = cmd.current_dir(repo_root).output().map_err(|e| Error::Io(e))?;
-    if !output.status.success() {
-        return Err(Error::Other(format!(
-            "git checkout 失败: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+        let exists = Command::new("git")
+            .args(["cat-file", "-e", &format!("{commit_hash}:{f}")])
+            .current_dir(repo_root)
+            .status()
+            .map_err(Error::Io)?
+            .success();
+        if exists {
+            let output = Command::new("git")
+                .args(["checkout", commit_hash, "--", f])
+                .current_dir(repo_root)
+                .output()
+                .map_err(Error::Io)?;
+            if !output.status.success() {
+                return Err(Error::Other(format!(
+                    "git checkout 失败: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+        } else {
+            let path = repo_root.join(f);
+            if path.starts_with(repo_root) && path.exists() {
+                if path.is_dir() {
+                    std::fs::remove_dir_all(path)?;
+                } else {
+                    std::fs::remove_file(path)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -147,10 +170,7 @@ pub fn create_snapshot(repo_root: &Path, lease_id: &str) -> Result<LeaseSnapshot
 }
 
 /// 完成租约快照（记录变更文件）。
-pub fn finalize_snapshot(
-    repo_root: &Path,
-    snapshot: &mut LeaseSnapshot,
-) -> Result<()> {
+pub fn finalize_snapshot(repo_root: &Path, snapshot: &mut LeaseSnapshot) -> Result<()> {
     // 获取自快照创建以来的变更文件
     let changed = git_changed_files_since(repo_root, &snapshot.commit_hash)?;
     // 也包含工作区未提交的变更
@@ -194,7 +214,7 @@ pub fn save_snapshot_to(dir: &Path, snapshot: &LeaseSnapshot) -> Result<()> {
 /// 从磁盘加载快照。
 pub fn load_snapshot(domain_root: &Path, lease_id: &str) -> Result<Option<LeaseSnapshot>> {
     let path = snapshot_dir(domain_root).join(format!("{}.json", lease_id));
-    load_snapshot_from(&path.parent().unwrap_or(Path::new(".")), lease_id)
+    load_snapshot_from(path.parent().unwrap_or(Path::new(".")), lease_id)
 }
 
 /// 从指定目录加载快照。
@@ -236,7 +256,15 @@ pub fn list_snapshots_from(dir: &Path) -> Result<Vec<LeaseSnapshot>> {
 
 /// 删除快照。
 pub fn delete_snapshot(domain_root: &Path, lease_id: &str) -> Result<()> {
-    let path = snapshot_dir(domain_root).join(format!("{}.json", lease_id));
+    let direct = domain_root.join(format!("{}.json", lease_id));
+    let dir = if direct.exists()
+        || domain_root.file_name().and_then(|n| n.to_str()) == Some("snapshots")
+    {
+        domain_root.to_path_buf()
+    } else {
+        snapshot_dir(domain_root)
+    };
+    let path = dir.join(format!("{}.json", lease_id));
     if path.exists() {
         std::fs::remove_file(path)?;
     }

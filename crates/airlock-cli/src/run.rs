@@ -166,6 +166,7 @@ impl Tx {
                         },
                         "L1",
                         Some(session_id),
+                        None,
                     );
                 }
                 let _ = resources::end_session_ports(store, session_id);
