@@ -69,4 +69,9 @@ jobs:
           sudo apt-get install -y -qq build-essential
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           source "$HOME/.cargo/env"
+          # 测试临时仓库（SQLite WAL + fcntl 锁）必须落在 WSL 原生文件系统：
+          # DrvFS/9P 上的 fcntl 锁不可靠（FileLockingProtocolFailed）。
+          # /var/tmp 为 ext4 原生盘，且路径短（兼容 macOS SUN_LEN 语义的测试假设）。
+          export TMPDIR=/var/tmp/airlock-ci
+          mkdir -p "$TMPDIR"
           cargo test --workspace

@@ -5,8 +5,20 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+/// macOS 的 `std::env::temp_dir()`（/var/folders/...）会让 unix socket 路径超过
+/// `SUN_LEN`(104)，daemon.sock 无法绑定——macOS 上改用 /tmp（/private/tmp）。
+#[cfg(target_os = "macos")]
+fn short_tmp() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn short_tmp() -> PathBuf {
+    std::env::temp_dir()
+}
+
 fn temp_repo(tag: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("airlock-cli-it-{tag}-{}", std::process::id()));
+    let root = short_tmp().join(format!("airlock-cli-it-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     Command::new("git")
@@ -548,7 +560,7 @@ fn l2_run_wrapper_real_enforcement() {
 /// 通过 CLI doctor 的 JSON 探测 Landlock ABI（避免测试进程内 syscall）。
 fn airlock_core_ffi_abi() -> u32 {
     let exe = env!("CARGO_BIN_EXE_airlock");
-    let root = std::env::temp_dir().join(format!("airlock-probe-{}", std::process::id()));
+    let root = short_tmp().join(format!("airlock-probe-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&root);
     let out = Command::new(exe)
         .args(["--root"])

@@ -9,6 +9,18 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+/// macOS 的 `std::env::temp_dir()`（/var/folders/...）会让 unix socket 路径超过
+/// `SUN_LEN`(104)，daemon.sock 无法绑定——macOS 上改用 /tmp（/private/tmp）。
+#[cfg(target_os = "macos")]
+fn short_tmp() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn short_tmp() -> PathBuf {
+    std::env::temp_dir()
+}
+
 struct Env {
     root: PathBuf,
     sock: PathBuf,
@@ -18,7 +30,7 @@ struct Env {
 impl Env {
     /// 启动 daemon 于临时 git 仓库。
     fn new(tag: &str) -> Env {
-        let root = std::env::temp_dir().join(format!("airlock-it-{tag}-{}", std::process::id()));
+        let root = short_tmp().join(format!("airlock-it-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src/auth")).unwrap();
         std::fs::create_dir_all(root.join("src/api")).unwrap();
@@ -273,7 +285,7 @@ fn ac1_5_thousand_concurrent_claims() {
 
 #[test]
 fn ac2_5_enforcement_off_l0_badge() {
-    let root = std::env::temp_dir().join(format!("airlock-it-ac25-{}", std::process::id()));
+    let root = short_tmp().join(format!("airlock-it-ac25-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     Command::new("git")
@@ -496,7 +508,7 @@ fn perf_claim_latency_budget() {
 
 #[test]
 fn sqlite_corrupt_refuses_startup() {
-    let root = std::env::temp_dir().join(format!("airlock-it-corrupt-{}", std::process::id()));
+    let root = short_tmp().join(format!("airlock-it-corrupt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join(".git/airlock")).unwrap();
     std::fs::write(

@@ -14,6 +14,18 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+/// macOS 的 `std::env::temp_dir()`（/var/folders/...）会让 unix socket 路径超过
+/// `SUN_LEN`(104)，daemon.sock 无法绑定——macOS 上改用 /tmp（/private/tmp）。
+#[cfg(target_os = "macos")]
+fn short_tmp() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn short_tmp() -> PathBuf {
+    std::env::temp_dir()
+}
+
 struct Env {
     root: PathBuf,
     sock: PathBuf,
@@ -32,7 +44,7 @@ impl Env {
         credentials: Option<&str>,
         policy: Option<&str>,
     ) -> Env {
-        let root = std::env::temp_dir().join(format!("airlock-v2-{tag}-{}", std::process::id()));
+        let root = short_tmp().join(format!("airlock-v2-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("vault")).unwrap();
@@ -168,7 +180,7 @@ fn f12_policy_rejects_claim_over_daemon() {
 
 #[test]
 fn f12_broken_policy_fails_daemon_boot() {
-    let root = std::env::temp_dir().join(format!("airlock-v2-badpol-{}", std::process::id()));
+    let root = short_tmp().join(format!("airlock-v2-badpol-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     Command::new("git")
