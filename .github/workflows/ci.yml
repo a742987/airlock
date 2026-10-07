@@ -63,6 +63,10 @@ jobs:
       - name: WSL2 内安装 Rust 并测试
         shell: wsl-bash {0}
         run: |
+          # rustup --profile minimal 不含链接器；bundled SQLite / tree-sitter 的 C
+          # 编译需要 cc（缺失时 `linker 'cc' not found`，CI 自首日起失败的原因）
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           source "$HOME/.cargo/env"
           cargo test --workspace

@@ -15,6 +15,9 @@ use std::sync::Arc;
 
 use airlock_core::enforce::resolve_layer;
 use airlock_core::error::{Error, Result};
+// landlock 模块整体被 cfg(target_os = "linux") 门控（非 Linux 平台模块不存在），
+// 导入必须同步门控——否则 macOS/Windows 编译失败（E0432）
+#[cfg(target_os = "linux")]
 use airlock_core::landlock;
 use airlock_core::proto::{self, Actor, ClaimOk, SessionInfo};
 use airlock_core::resources;
@@ -551,7 +554,11 @@ pub fn run_wrapped(ctx: &Ctx, args: &[String]) -> Result<i32> {
 
     // L2 落地：应用 Landlock（layer=L2 且可用时；仅 Linux——L2 只在 Linux 可用，
     // 其他平台 resolve_layer 不会返回可用的 L2）。警告分支保持平台无关。
+    // enforced 仅在 cfg(linux) 分支被赋值——非 Linux 平台声明为不可变避免 unused_mut
+    #[cfg(target_os = "linux")]
     let mut enforced = false;
+    #[cfg(not(target_os = "linux"))]
+    let enforced = false;
     #[cfg(target_os = "linux")]
     if layer.id == "L2" && layer.available {
         match landlock::restrict_write_except(&allowed, &denied) {
