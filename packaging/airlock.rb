@@ -1,12 +1,14 @@
 # Homebrew formula：brew tap airlock-dev/tap && brew install airlock
 #
-# v0.5.0：包含 F5 tree-sitter 符号级冲突预测、F6 成本归因、F7 租约快照与隔离回滚。
-# 发布后填入 sha256 行（tarball 校验和）：shasum -a 256 v0.5.0.tar.gz
+# v2.0.0：包含 F5 符号级冲突预测、F6 成本归因、F7 隔离回滚、
+#         F12 政策即代码（airlock.policy.toml）、F13 凭据作用域代理。
+# 打 tag 后填入 sha256 行（tarball 校验和）：
+#   curl -sL https://github.com/airlock-dev/airlock/archive/refs/tags/v2.0.0.tar.gz | shasum -a 256
 class Airlock < Formula
   desc "Kernel-enforced file leases for parallel AI coding agents"
   homepage "https://github.com/airlock-dev/airlock"
-  url "https://github.com/airlock-dev/airlock/archive/refs/tags/v0.5.0.tar.gz"
-  # sha256 "TODO_FILL_AFTER_RELEASE"
+  url "https://github.com/airlock-dev/airlock/archive/refs/tags/v2.0.0.tar.gz"
+  # sha256 "TODO_FILL_AFTER_TAGGING"
   head "https://github.com/airlock-dev/airlock.git", branch: "main"
   license any_of: ["MIT", "Apache-2.0"]
 
@@ -26,10 +28,10 @@ class Airlock < Formula
       Linux ≥5.13（含 WSL2）上 `airlock run` 提供 L2 Landlock 真实拒绝。
       L3 BPF-LSM 为规划中：当前仅探测内核能力，不拦截。
 
-      v0.5.0 新特性：
-        - F5: tree-sitter 符号级冲突预测（claim 时识别函数/类/方法级冲突）
-        - F6: 成本归因（tower TUI 显示每个租约的 token 消耗和成本）
-        - F7: 租约快照与隔离回滚（airlock rollback <lease-id> 撤销单个 agent 的改动）
+      v2.0.0 新特性：
+        - F12: 政策即代码（airlock.policy.toml 在 claim 时驱动内核拒绝；
+          配方见 docs/policy-cookbook.md）
+        - F13: 凭据作用域代理（claim --cred <资源> 随租约发放，释放 ≤60s 吊销）
 
       快速开始：
         airlock daemon start

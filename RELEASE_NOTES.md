@@ -1,307 +1,110 @@
-# Airlock v0.5.0 Release Notes
+# Airlock v2.0.0 Release Notes
 
-> **状态**: Beta Ready  
-> **发布日期**: 2026-10-04  
-> **质量评分**: 95/100 ⭐⭐⭐⭐⭐
+> **状态**: Production Ready（v2.0 验收标准全部落地）  
+> **发布日期**: 2026-10-07  
+> **里程碑**: 政策即代码 + 凭据作用域代理——Authorize 阶段上线
 
 ---
 
 ## 🎉 主要新增功能
 
-### F6: 成本归因
-跟踪每个租约的 token 消耗和 API 成本，支持多 agent 工作流的成本分析。
+### F12: 政策即代码（`airlock.policy.toml`）
 
-**新增字段**:
-- `tokens_used`: 累计 token 消耗
-- `cost_cents`: 累计成本（美分）
-
-**新增命令**:
-```bash
-airlock report-cost <lease-id> --tokens 1000 --cost-cents 50
-```
-
-**特性**:
-- ✅ 自动累加（饱和加法，防溢出）
-- ✅ 租约级别隔离
-- ✅ 支持多次上报
-
----
-
-### F7: 隔离回滚
-Git 快照 + 一键回滚，为 agent 工作流提供事务性操作。
+把治理规则写进仓库、随 PR 审查，claim 时由政策引擎求值并**驱动两层拒绝**：
+claim 层 409（`error="policy"`，载荷含命中规则与建议动作）+ L2 内核层
+（deny 子树从 Landlock 允许集**减去**，`airlock run` 下真实 `-EPERM`）。
 
 **新增命令**:
-```bash
-airlock snapshots              # 列出所有快照
-airlock rollback <lease-id>    # 回滚指定租约的变更
-```
 
-**工作流程**:
-1. `claim` 时自动创建快照（记录 git commit hash）
-2. `release` 时完成快照（记录变更文件列表）
-3. `rollback` 时恢复到快照时刻的状态
+```bash
+airlock policy check                       # 校验 + 摘要（sha256、未提交改动警告）
+airlock policy check --glob 'vault/**' --agent codex   # 干跑一次决策
+airlock --json policy check --glob 'src/**' --ttl 7200 # 机器可读（deny_kind / ttl_cap）
+```
 
 **特性**:
-- ✅ 自动快照创建
-- ✅ 变更文件追踪
-- ✅ 一键回滚
-- ✅ 多租约隔离（租约 A 的回滚不影响租约 B）
 
----
+- ✅ 路径规则（deny 永远赢，顺序无关）/ agent 白名单 / TTL 上限（clamp）
+- ✅ 文件不存在 = 零配置全放行（P3）；存在且非法 = fail-closed（claim 拒绝 + daemon 拒绝启动）
+- ✅ 政策加载与拒绝入审计（含 sha256），入库提交即可追溯
+- ✅ 政策 deny 解析为具体目录（字面量前缀 + 通配规则文件遍历，上限 256 条）
 
-### F5: 符号级冲突预测
-使用 tree-sitter 解析源代码，提供函数/类级别的冲突预测。
+### F13: 凭据作用域代理
 
-**支持语言**:
-- Rust
-- Python  
-- JavaScript/TypeScript
-- 可扩展到更多语言
+凭据随租约发放（`claim --cred <资源>`，env 随响应注入）、租约释放/过期即吊销——
+sweeper 1 秒周期，**≤60s 失效为结构性保证**（集成测试断言）。
+
+**新增命令**:
+
+```bash
+airlock claim 'src/**' --cred app-db
+airlock creds list [--lease <id>]     # env 值脱敏为变量名清单
+airlock creds revoke <cred-id>        # 立即吊销（管理员）
+```
 
 **特性**:
-- ✅ 精准的符号提取
-- ✅ 智能冲突分析
-- ✅ 大文件保护（>1MB 自动跳过）
+
+- ✅ 后端可插拔 trait：`file`（零外部依赖）/ `vault`（HashiCorp Vault 动态密钥）
+- ✅ 发放失败 → 租约回滚（P1-5：部分失败不泄漏）；吊销失败 → sweeper 自愈重试
+- ✅ 幂等 claim 复用现存 active 凭据（不重复发放）
+- ✅ 安全边界：只代理测试资源凭据，提交密钥与仓库凭据永不经过 Airlock 进程
 
 ---
 
-## 🐛 Bug 修复
+## 📡 协议 v2（全 additive，向后兼容）
 
-### 关键修复（P0）
-1. **添加混沌测试套件**
-   - 1000 并发 claim 测试
-   - 验证无死锁、无状态错乱
-   - 审计链完整性验证
+- 方法：`creds_list` / `creds_revoke`；
+- claim/ensure_claim：新参数 `cred`，响应新字段 `credentials`；
+- 409 载荷：新字段 `policy {rule, kind}`；`suggested_action` 词表 +2；
+- 审计事件词表 +5：`policy_load / policy_deny / policy_clamp / cred_issue / cred_revoke`；
+- 存储：`credentials` 表 + `meta.schema_version = 2`（只升不降）。
 
-2. **F7 快照完整接线**
-   - 修复 release/expire 时未完成快照的问题
-   - 确保变更文件被正确记录
-
-3. **F6/F7 集成测试**
-   - 新增 13 个端到端测试
-   - 覆盖成本累加、快照回滚、多租约隔离
-
-### 次要修复（P1）
-4. **符号解析器大文件保护**
-   - 防止超大文件（>1MB）耗尽内存
-   - 优雅降级到文件级预测
-
-5. **成本归因溢出保护**
-   - 使用饱和加法防止 u64 溢出回绕
-   - 累加到 `u64::MAX` 后保持不变
-
-### 文档修复（P2）
-6. **版本号一致性**
-   - 修正 protocol.md 中的版本描述
-   - 标注 v0.5.0 为"开发中"
+v1.0 冻结面（方法/字段/退出码）无一变更；详见 [docs/protocol.md §9](docs/protocol.md)。
 
 ---
 
-## 📊 质量提升
+## 🧪 测试与质量
 
-| 指标 | v0.4.x | v0.5.0 | 提升 |
-|------|--------|--------|------|
-| 总体评分 | 92/100 | **95/100** | +3 |
-| 测试覆盖 | 85/100 | **90/100** | +5 |
-| 质量等级 | Alpha | **Beta** | ⬆️ |
-
----
-
-## 🧪 新增测试
-
-### 混沌测试（4 个）
-**文件**: `crates/airlockd/tests/chaos.rs`
-
-1. `chaos_1000_concurrent_claims_non_overlapping` - 1000 并发无冲突
-2. `chaos_1000_concurrent_claims_with_conflicts` - 1000 并发有冲突
-3. `chaos_concurrent_claim_and_release` - 并发 claim/release
-4. `chaos_stress_audit_chain` - 10000 条审计链压测
-
-### F6/F7 集成测试（9 个）
-**文件**: `crates/airlock-core/tests/f6_f7_integration.rs`
-
-**F6 测试**:
-- `test_f6_cost_accumulation` - 成本累加
-- `test_f6_cost_multiple_leases` - 多租约成本独立性
-- `test_f6_cost_zero_values` - 零值边界
-
-**F7 测试**:
-- `test_f7_snapshot_lifecycle` - 完整快照生命周期
-- `test_f7_snapshot_no_changes` - 无变更场景
-- `test_f7_snapshot_multiple_leases` - 多租约隔离回滚
-- `test_f7_snapshots_list` - 快照列表与删除
+- 新增集成测试 14 项（core / airlockd / CLI / 独立 Landlock 内核测试）：
+  - 政策拒绝 409 载荷 + `policy_deny` 审计 + sha256 记录；
+  - TTL 钳制（clamp + `policy_clamp` 审计）；
+  - 坏政策 fail-closed：claim 拒绝 + **daemon 拒绝启动（exit 5）**；
+  - **内核级政策 EPERM**：deny 子树被拒、同级散文件仍可写（文件级 Landlock 规则）；
+  - 凭据全生命周期：发放 → 脱敏清单 → release → sweeper 吊销（断言 <60s）；
+  - 凭据发放失败回滚（status 确认无泄漏租约）；
+- 全仓 `cargo test --workspace`（含 1000 并发 chaos 套件）、`clippy -D warnings`、`fmt --check` 全绿；
+- 内核兼容性实测：文件级 Landlock 规则在严格内核（ABI 8，文件 FD 仅接受纯
+  `WRITE_FILE` 位）下自动降级尝试，兼容老内核。
 
 ---
 
-## 📚 文档更新
+## 📦 升级与兼容
 
-### 新增文档
-1. **REVIEW_REPORT.md** - 15,000+ 字完整技术报告
-2. **检查清单.md** - 详细检查项与评分
-3. **关键问题分析.md** - 技术问题与解决方案
-4. **修复完成报告.md** - 修复记录与验证清单
-5. **完成总结.md** - 项目状态总结
-
-### 更新文档
-- `docs/protocol.md` - 更新 F6/F7 API 说明
-- `README.md` - 更新功能列表
-
----
-
-## 🔧 API 变更
-
-### 新增 MCP 方法
-```json
-// F6: 成本归因
-{
-  "method": "report_cost",
-  "params": {
-    "lease_id": "...",
-    "tokens_delta": 1000,
-    "cost_cents_delta": 50
-  }
-}
-
-// F7: 快照列表
-{
-  "method": "snapshots"
-}
-
-// F7: 回滚
-{
-  "method": "rollback",
-  "params": {
-    "lease_id": "..."
-  }
-}
-```
-
-### 新增 CLI 命令
-```bash
-airlock report-cost <lease-id> --tokens <n> --cost-cents <n>
-airlock snapshots
-airlock rollback <lease-id>
-```
-
-### 租约字段扩展
-```rust
-pub struct LeaseInfo {
-    // ... 原有字段 ...
-    pub tokens_used: u64,      // 新增
-    pub cost_cents: u64,       // 新增
-}
-```
-
----
-
-## ⚠️ 破坏性变更
-
-### 内部 API 变更
-以下函数签名增加了 `root: Option<&Path>` 参数：
-- `lease::release()`
-- `lease::release_all()`
-- `lease::sweep()`
-- `lease::sweep_all()`
-
-**影响范围**: 仅内部 crate，不影响外部用户。
-
-**迁移指南**: 无需迁移（内部变更已完成）。
-
----
-
-## 📦 安装
-
-### 从源码构建
-```bash
-git clone https://github.com/your-org/airlock.git
-cd airlock
-git checkout v0.5.0
-cargo build --release
-```
-
-### 使用 Homebrew（macOS）
-```bash
-brew install airlock
-```
-
-### 从 crates.io
-```bash
-cargo install airlock-cli
-```
-
----
-
-## 🧪 测试验证
-
-### 运行测试套件
-```bash
-# 全部测试
-cargo test --workspace
-
-# 混沌测试
-cargo test --test chaos
-
-# F6/F7 集成测试
-cargo test --test f6_f7_integration
-
-# 代码检查
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
-```
-
-### CI 状态
-- ✅ Ubuntu 22.04
-- ✅ macOS 13
-- ✅ Windows Server 2022
+- 从 v0.5.x / 1.0.0 升级：无数据迁移（新表按需创建），协议 additive，旧客户端可用；
+- 新增可选依赖 `ureq`（F13 Vault 集成）；
+- 两项新功能默认关闭/不存在即不生效——不写政策文件、不配 `credentials_backend`
+  时行为与 v0.x 完全一致；
+- 版本号历史说明：1.0.0 为协议冻结占位（F8 未交付）；v2.0.0 首次落实路线图
+  v2.0 验收标准并补打 git tag `v2.0.0`；
+- Team 版（企业规则源/审计导出）按路线图 §4.4 口径延后至商业决策点（v5.0 GA）。
 
 ---
 
 ## 🗺️ 后续规划
 
-### v0.5.1（维护版本）
-- 性能优化
-- 用户反馈修复
-- 文档完善
+- v2.5：Windows 原生（NTFS deny-ACE Guard、winget/MSI + 代码签名）
+- v3.0：跨租约事务（two-phase claim）转正、插件系统 v1
+- F8 跨机 gRPC（v1.0 遗留）：独立推进，不阻塞 v2.x 功能线
 
-### v0.6.0（稳定版本）
-- 端到端测试框架
-- 性能基准测试
-- 更多语言支持（F5）
+## 相关文档
 
-### v1.0.0（GA）
-- 发布版本统一为 `1.0.0`，冻结租约协议 v1、CLI 退出码和 MCP 接口。
-- 新增可选本机 TCP/NDJSON 传输（`airlockd --listen` 或 `listen_addr`），默认关闭，
-  仅允许回环地址，并与本地 Unix socket 使用同一请求/响应格式。
-- 修复测试与运行时 API 漂移，支持离线构建验证。
-- L3 BPF-LSM 实现
-- 生产级监控
-- API 稳定性保证
+- [CHANGELOG_v2.0.0.md](./CHANGELOG_v2.0.0.md)
+- [政策 cookbook](./docs/policy-cookbook.md)
+- [租约协议规范 v2](./docs/protocol.md)
+- [产品设计规范（PRD）](./Airlock-产品设计规范.md)
 
 ---
 
-## 👥 贡献者
-
-- **a742987** - 项目负责人
-- **Claude Sonnet 5** - 代码审查与测试
-
----
-
-## 📄 许可证
-
-Apache-2.0
-
----
-
-## 🔗 相关链接
-
-- [完整技术报告](./REVIEW_REPORT.md)
-- [检查清单](./检查清单.md)
-- [修复完成报告](./修复完成报告.md)
-- [协议规范](./docs/protocol.md)
-- [GitHub 仓库](https://github.com/your-org/airlock)
-
----
-
-**感谢使用 Airlock v1.0.0！**
+**感谢使用 Airlock v2.0.0！**
 
 如有问题或建议，请提交 GitHub Issue 或联系维护团队。
