@@ -86,6 +86,7 @@ impl Tx {
                             with_leases: vec![],
                             involved_symbols: vec![],
                         },
+                        credentials: None,
                     });
                 }
                 airlock_core::lease::claim(store, cfg, p)

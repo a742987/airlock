@@ -67,6 +67,9 @@ enum Command {
         /// TTL：秒数或时长（1800 / 30m / 1h），默认 30 分钟
         #[arg(long)]
         ttl: Option<String>,
+        /// F13：随租约发放凭据的资源名（如测试库 app-db），释放即吊销
+        #[arg(long)]
+        cred: Option<String>,
     },
     /// 释放租约
     Release {
@@ -113,6 +116,12 @@ enum Command {
     },
     /// 强制层探测 + 健康检查 + 升级建议（不阻塞）
     Doctor,
+    /// F12 政策即代码：校验 airlock.policy.toml 并干跑决策
+    #[command(subcommand)]
+    Policy(PolicyCmd),
+    /// F13 凭据代理：查看与吊销随租约发放的凭据
+    #[command(subcommand)]
+    Creds(CredsCmd),
     /// 冲突域黑板（v0.2 F11）
     #[command(subcommand)]
     Board(BoardCmd),
@@ -137,6 +146,33 @@ enum Command {
     /// 内部：MCP stdio server（由 agent 以 MCP 方式拉起）
     #[command(hide = true)]
     Mcp,
+}
+
+#[derive(Subcommand)]
+pub enum PolicyCmd {
+    /// 校验政策文件并干跑决策（--glob 指定申请路径；无 --glob 时打印政策摘要）
+    Check {
+        /// 干跑的申请路径模式（如 src/auth/**）
+        #[arg(long)]
+        glob: Option<String>,
+        /// 干跑的 agent（默认 cli）
+        #[arg(long)]
+        agent: Option<String>,
+        /// 干跑的 TTL（秒）
+        #[arg(long)]
+        ttl: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CredsCmd {
+    /// 列出凭据发放记录（env 值脱敏为变量名清单；--lease 过滤）
+    List {
+        #[arg(long)]
+        lease: Option<String>,
+    },
+    /// 立即吊销凭据（管理员；租约释放后 sweeper 也会在 ≤60s 内自动吊销）
+    Revoke { cred_id: String },
 }
 
 #[derive(Subcommand)]
@@ -200,9 +236,18 @@ fn real_main(cli: &Cli) -> i32 {
     };
     let r = match &cli.command {
         Command::Init { agent, undo, yes } => init::run(&ctx, agent.as_deref(), *undo, *yes),
-        Command::Claim { glob, intent, ttl } => {
-            commands::claim(&ctx, glob, intent.as_deref(), ttl.as_deref())
-        }
+        Command::Claim {
+            glob,
+            intent,
+            ttl,
+            cred,
+        } => commands::claim(
+            &ctx,
+            glob,
+            intent.as_deref(),
+            ttl.as_deref(),
+            cred.as_deref(),
+        ),
         Command::Release { lease_id, all } => commands::release(&ctx, lease_id.as_deref(), *all),
         Command::Heartbeat { lease_id } => commands::heartbeat(&ctx, lease_id),
         Command::ReportCost {
@@ -215,6 +260,10 @@ fn real_main(cli: &Cli) -> i32 {
         Command::Status { free } => commands::status(&ctx, *free),
         Command::Log { verify, since } => commands::log(&ctx, *verify, since.as_deref()),
         Command::Doctor => commands::doctor(&ctx),
+        Command::Policy(PolicyCmd::Check { glob, agent, ttl }) => {
+            commands::policy_check(&ctx, glob.as_deref(), agent.as_deref(), *ttl)
+        }
+        Command::Creds(cmd) => commands::creds(&ctx, cmd),
         Command::Board(cmd) => commands::board(&ctx, cmd),
         Command::Daemon(DaemonCmd::Spawn) => Ok(commands::spawn_daemon_foreground(&ctx)),
         Command::Daemon(cmd) => commands::daemon(&ctx, cmd),

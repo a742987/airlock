@@ -105,7 +105,8 @@ fn errno_str(op: &'static str) -> LandlockError {
 }
 
 /// 在当前进程（及未来子进程）上应用 Landlock：
-/// 读全放行；写仅允许 `allowed_write` 列出的路径树下（已存在的目录/文件）。
+/// 读全放行；写仅允许 `allowed_write` 列出的路径树下（已存在的目录/文件），
+/// 但**减去 `denied_write` 列出的子树**（F12 政策即代码：deny 规则在内核层拒绝）。
 /// 成功后本进程无法再放宽——调用方须先完成全部准备再 restrict。
 ///
 /// 安全设计（P0）：每条路径先 `canonicalize()` 解析全部符号链接再打开，
@@ -114,6 +115,7 @@ fn errno_str(op: &'static str) -> LandlockError {
 /// 符号链接本体不再被跟随。
 pub fn restrict_write_except(
     allowed_write: &[std::path::PathBuf],
+    denied_write: &[std::path::PathBuf],
 ) -> std::result::Result<(), LandlockError> {
     let abi = abi_version();
     if abi < 1 {
@@ -139,22 +141,26 @@ pub fn restrict_write_except(
     }
     let ruleset_fd = ruleset_fd as i32;
 
-    let add_path = |parent: &Path, allowed: u64| -> std::result::Result<(), LandlockError> {
+    let open_no_follow = |path: &Path, dir_only: bool| -> std::result::Result<i32, LandlockError> {
         // O_PATH：只取路径引用，不触发权限检查；O_NOFOLLOW：绝不跟随符号链接
-        let cpath = std::os::unix::ffi::OsStrExt::as_bytes(parent.as_os_str());
+        let cpath = std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str());
         let cstring = std::ffi::CString::new(cpath).map_err(|_| LandlockError {
             op: "open",
             detail: "路径含 NUL".into(),
         })?;
-        let fd = unsafe {
-            libc::open(
-                cstring.as_ptr(),
-                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
-            )
-        };
-        if fd < 0 {
-            return Err(errno_str("open"));
+        let mut flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if dir_only {
+            flags |= libc::O_DIRECTORY;
         }
+        let fd = unsafe { libc::open(cstring.as_ptr(), flags) };
+        if fd < 0 {
+            Err(errno_str("open"))
+        } else {
+            Ok(fd)
+        }
+    };
+
+    let add_rule = |fd: i32, allowed: u64| -> std::result::Result<(), LandlockError> {
         let rule = LandlockPathBeneathAttr {
             allowed_access: allowed & (READ_BITS | handled),
             parent_fd: fd as i64,
@@ -168,41 +174,55 @@ pub fn restrict_write_except(
                 0u32,
             )
         };
-        unsafe { libc::close(fd) };
         if rc != 0 {
             return Err(errno_str("add_rule"));
         }
         Ok(())
     };
 
+    let add_dir = |parent: &Path| -> std::result::Result<(), LandlockError> {
+        let fd = open_no_follow(parent, true)?;
+        let rc = add_rule(fd, handled);
+        unsafe { libc::close(fd) };
+        rc
+    };
+
+    // F12：文件级规则（被政策拒绝子树的同级散文件兜底）。
+    // 内核对**文件 FD** 的 allowed_access 校验极严：实测（ABI 8）混入
+    // REMOVE_FILE/TRUNCATE/REFER 一律 EINVAL，只接受纯 WRITE_FILE。
+    // 策略：先尝试 WRITE_FILE|TRUNCATE（宽松内核可覆盖 O_TRUNC 写），
+    // EINVAL 再退回纯 WRITE_FILE；仍失败则该文件不可写（fail-closed），
+    // 绝不让单个文件规则失败放大成整体失败。
+    let add_file = |path: &Path| -> std::result::Result<(), LandlockError> {
+        let fd = open_no_follow(path, false)?;
+        let mut bits = LL_FS_WRITE_FILE;
+        if abi >= 3 {
+            bits |= LL_FS_TRUNCATE;
+        }
+        if add_rule(fd, bits).is_err() {
+            let _ = add_rule(fd, LL_FS_WRITE_FILE);
+        }
+        unsafe { libc::close(fd) };
+        Ok(())
+    };
+
     let apply = || -> std::result::Result<(), LandlockError> {
+        // 先统一 canonicalize（老行为：不存在的路径跳过），再做政策减法——
+        // starts_with 比较必须在同一规范化坐标系上进行
+        let canon = |list: &[std::path::PathBuf]| -> Vec<std::path::PathBuf> {
+            list.iter().filter_map(|p| p.canonicalize().ok()).collect()
+        };
+        let allowed = canon(allowed_write);
+        let denied = canon(denied_write);
+        let (dirs, files) = subtract_denied(&allowed, &denied)?;
         let mut seen = std::collections::HashSet::new();
-        for p in allowed_write {
-            // 先解析全部符号链接；不存在的路径跳过（与旧行为一致）
-            let Ok(canon) = p.canonicalize() else {
-                continue;
-            };
-            // 内核约束：PATH_BENEATH 规则只能挂在**目录**上（allowed ⊆ handled，
-            // 多余位 → EINVAL）。普通文件授权落地到其父目录——即 L2 强制粒度是目录级
-            // （文档明示：文件级冲突仍在 L1/MCP/hook 层拒绝）。字符设备无法授权，
-            // 调用方应改授其父目录（如 /dev 覆盖 /dev/null、/dev/pts）。
-            let meta = std::fs::symlink_metadata(&canon).map_err(|e| LandlockError {
-                op: "stat",
-                detail: e.to_string(),
-            })?;
-            let target: std::path::PathBuf = if meta.is_dir() {
-                canon.clone()
-            } else if meta.is_file() {
-                match canon.parent() {
-                    Some(parent) if parent != canon => parent.to_path_buf(),
-                    _ => continue,
-                }
-            } else {
-                continue; // 特殊文件：跳过
-            };
-            if seen.insert(target.clone()) {
-                add_path(&target, handled)?;
+        for d in &dirs {
+            if seen.insert(d.clone()) {
+                add_dir(d)?;
             }
+        }
+        for f in &files {
+            let _ = add_file(f);
         }
         Ok(())
     };
@@ -239,3 +259,144 @@ pub fn check_available() -> Result<()> {
 // 注意：restrict_self 是进程级且不可逆的行为测试已移至
 // tests/landlock_integration.rs——lib 单元测试与它共用同一测试进程时，
 // 任何一次 restrict 都会污染其他并行测试的 /tmp 写入。
+
+/// F12 政策减法的最大展开深度：超过即放弃该分支（fail-closed——被拒子树
+/// 可能藏得更深，宁可收紧也不放行整个父目录）。
+const MAX_EXPAND_DEPTH: usize = 16;
+
+/// 从允许写集合中减去被政策拒绝的子树（F12：Landlock 只有允许规则，无 deny）。
+///
+/// 「父目录被允许、子目录被拒」时必须把父目录展开到子级、跳过被拒分支，
+/// 递归直到无冲突；展开产生的**散文件**用文件级规则精确授权。展开失败
+/// （read_dir 不可读）向上传播 → 调用方整体降级 L1（绝不静默放宽）。
+/// 返回 (目录规则, 文件规则)；`denied` 为空时目录=全部允许目录、文件=允许文件。
+fn subtract_denied(
+    allowed: &[std::path::PathBuf],
+    denied: &[std::path::PathBuf],
+) -> std::result::Result<(Vec<std::path::PathBuf>, Vec<std::path::PathBuf>), LandlockError> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for a in allowed {
+        expand_path(a, denied, 0, &mut dirs, &mut files)?;
+    }
+    dirs.sort();
+    dirs.dedup();
+    files.sort();
+    files.dedup();
+    Ok((dirs, files))
+}
+
+fn expand_path(
+    path: &std::path::Path,
+    denied: &[std::path::PathBuf],
+    depth: usize,
+    dirs: &mut Vec<std::path::PathBuf>,
+    files: &mut Vec<std::path::PathBuf>,
+) -> std::result::Result<(), LandlockError> {
+    // 位于被拒子树内（含恰好相等）→ deny 永远赢
+    if denied.iter().any(|d| path.starts_with(d)) {
+        return Ok(());
+    }
+    // path 之下的被拒子树
+    let has_conflict = denied.iter().any(|d| d.starts_with(path));
+    if !has_conflict {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| LandlockError {
+            op: "stat",
+            detail: format!("{}: {e}", path.display()),
+        })?;
+        if meta.is_dir() {
+            dirs.push(path.to_path_buf());
+        } else if meta.is_file() {
+            if depth == 0 {
+                // 旧语义：显式授权的普通文件落地为父目录整树——但父目录含
+                // 被拒子树时退化为文件级规则（政策不被父目录授权穿透）
+                let parent_conflict = path
+                    .parent()
+                    .map(|p| denied.iter().any(|d| d.starts_with(p)))
+                    .unwrap_or(false);
+                match (path.parent(), parent_conflict) {
+                    (Some(parent), false) if parent != path => dirs.push(parent.to_path_buf()),
+                    _ => files.push(path.to_path_buf()),
+                }
+            } else {
+                files.push(path.to_path_buf());
+            }
+        } // 特殊文件（设备/套接字等）：跳过，与旧行为一致
+        return Ok(());
+    }
+    // path 下有被拒子树 → 必须展开细分；非目录不可能包含子树（防御性返回）
+    if depth >= MAX_EXPAND_DEPTH
+        || !std::fs::symlink_metadata(path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+    {
+        return Ok(()); // 深度耗尽：fail-closed，不放行
+    }
+    let entries = std::fs::read_dir(path).map_err(|e| LandlockError {
+        op: "policy_expand",
+        detail: format!("{}: {e}", path.display()),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| LandlockError {
+            op: "policy_expand",
+            detail: format!("{}: {e}", path.display()),
+        })?;
+        let ft = entry.file_type().map_err(|e| LandlockError {
+            op: "policy_expand",
+            detail: format!("{}: {e}", path.display()),
+        })?; // 不跟随符号链接
+        let child = entry.path();
+        if ft.is_symlink() {
+            // P0：展开中的符号链接一律跳过——跟随可能把规则挂到仓库外
+            continue;
+        }
+        expand_path(&child, denied, depth + 1, dirs, files)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 政策减法是纯路径逻辑（无 syscall 副作用），在临时目录上直接验证。
+    #[test]
+    fn subtract_denied_splits_allowed_tree() {
+        let tmp = std::env::temp_dir().join(format!("airlock-ll-sub-{}", std::process::id()));
+        let src = tmp.join("src");
+        let gen = src.join("generated");
+        std::fs::create_dir_all(&gen).unwrap();
+        std::fs::write(src.join("main.rs"), b"x").unwrap();
+        std::fs::write(src.join("lib.rs"), b"x").unwrap();
+
+        // 允许整个 src，拒绝 src/generated：应展开为 src 下的散文件规则 + 无 src 目录规则
+        let (dirs, files) =
+            subtract_denied(std::slice::from_ref(&src), std::slice::from_ref(&gen)).unwrap();
+        assert!(dirs.is_empty(), "父目录不得整体放行：{dirs:?}");
+        assert!(files.contains(&src.join("main.rs")));
+        assert!(files.contains(&src.join("lib.rs")));
+
+        // 无冲突时保持整目录授权（老路径行为不变）
+        let (dirs, files) = subtract_denied(std::slice::from_ref(&src), &[]).unwrap();
+        assert_eq!(dirs, vec![src.clone()]);
+        assert!(files.is_empty());
+
+        // deny 恰好等于允许目录 → 整体拒绝
+        let (dirs, files) =
+            subtract_denied(std::slice::from_ref(&gen), std::slice::from_ref(&gen)).unwrap();
+        assert!(dirs.is_empty() && files.is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn subtract_denied_drops_allowed_inside_denied() {
+        let tmp = std::env::temp_dir().join(format!("airlock-ll-sub2-{}", std::process::id()));
+        let vault = tmp.join("vault");
+        let inner = vault.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let (dirs, files) = subtract_denied(&[vault.clone(), inner.clone()], &[vault]).unwrap();
+        assert!(dirs.is_empty() && files.is_empty());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+}

@@ -372,6 +372,8 @@ pub fn run_wrapped(ctx: &Ctx, args: &[String]) -> Result<i32> {
 
     // claim 指定路径
     let mut lease_ids: Vec<String> = Vec::new();
+    // 子进程环境：会话 env 起底，claim 凭据（F13）与端口（F3）陆续并入
+    let mut port_env = session.env.clone();
     for (idx, g) in run.claims.iter().enumerate() {
         let intent = run.intents.get(idx).or(run.intents.first()).cloned();
         let params = lease::ClaimParams {
@@ -390,6 +392,18 @@ pub fn run_wrapped(ctx: &Ctx, args: &[String]) -> Result<i32> {
             Ok(ok) => {
                 let id8 = ok.lease.id.chars().take(8).collect::<String>();
                 lease_ids.push(ok.lease.id);
+                // F13：随租约发放的凭据注入子进程环境
+                if let Some(creds) = &ok.credentials {
+                    for (k, v) in creds {
+                        port_env.insert(k.clone(), v.clone());
+                    }
+                    if !ctx.out.quiet {
+                        ctx.out.println_stderr(&format!(
+                            "✓ 凭据 {} 项已随租约发放（释放即吊销）",
+                            creds.len()
+                        ));
+                    }
+                }
                 if !ctx.out.quiet {
                     ctx.out.println_stderr(&format!(
                         "✓ 已 claim {}（租约 {id8}）预测: {}",
@@ -414,7 +428,6 @@ pub fn run_wrapped(ctx: &Ctx, args: &[String]) -> Result<i32> {
     }
 
     // 端口分配（F3）：分配并注入 PORT/VITE_PORT/NEXT_PORT
-    let mut port_env = session.env.clone();
     if run.port {
         match tx.alloc_port(&session) {
             Ok(port) => {
@@ -482,12 +495,29 @@ pub fn run_wrapped(ctx: &Ctx, args: &[String]) -> Result<i32> {
     allowed.sort();
     allowed.dedup();
 
+    // F12 政策即代码：deny 规则解析为具体目录，从 Landlock 允许集减去——
+    // 被拒路径在本进程树内得到内核 EPERM（政策驱动内核拒绝的第二层）。
+    // 政策文件非法 → Error::Config（fail-closed；claim 层同样会拦）。
+    let denied: Vec<PathBuf> = match airlock_core::policy::Policy::load(&ctx.domain.root) {
+        Ok(Some(pol)) => pol
+            .denied_write_dirs(&ctx.domain.root)
+            .iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .collect(),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            cleanup(&mut tx, &lease_ids);
+            return Err(e);
+        }
+    };
+
     if run.dry_run {
         if ctx.out.json {
             let plan = serde_json::json!({
                 "session": session.session_id,
                 "leases": lease_ids,
                 "allowed_write": allowed,
+                "policy_denied_write": denied,
                 "cmd": run.cmd,
                 "env": port_env,
             });
@@ -505,6 +535,13 @@ pub fn run_wrapped(ctx: &Ctx, args: &[String]) -> Result<i32> {
             for a in &allowed {
                 ctx.out.println_stdout(&format!("  {}", a.display()));
             }
+            if !denied.is_empty() {
+                ctx.out
+                    .println_stdout(&ctx.out.yellow("政策拒绝写入（内核排除）："));
+                for a in &denied {
+                    ctx.out.println_stdout(&format!("  {}", a.display()));
+                }
+            }
             ctx.out
                 .println_stdout(&format!("命令：{}", run.cmd.join(" ")));
         }
@@ -517,7 +554,7 @@ pub fn run_wrapped(ctx: &Ctx, args: &[String]) -> Result<i32> {
     let mut enforced = false;
     #[cfg(target_os = "linux")]
     if layer.id == "L2" && layer.available {
-        match landlock::restrict_write_except(&allowed) {
+        match landlock::restrict_write_except(&allowed, &denied) {
             Ok(()) => enforced = true,
             Err(e) => {
                 // P2：绝不静默降级

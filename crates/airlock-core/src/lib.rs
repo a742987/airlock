@@ -8,11 +8,14 @@
 //! - [`predict`]   F5 冲突预测（file → directory 级）
 //! - [`proto`]     F4 接入层共享协议（IPC / MCP 载荷，P4 双形态）
 //! - [`store`]     §7 数据设计（SQLite WAL + hash-chained 审计）
+//! - [`policy`]    F12 政策即代码（airlock.policy.toml，claim 时驱动内核拒绝）
+//! - [`credentials`] F13 凭据作用域代理（凭据随租约发放与吊销）
 //! - [`glob`]      路径模式匹配与重叠判定
 //! - [`config`]    P3 零配置可用的可选配置层
 //! - [`messages`]  §6.2/§6.4 用户可见文案集中地（i18n 架构准备）
 
 pub mod config;
+pub mod credentials;
 pub mod enforce;
 pub mod error;
 pub mod glob;
@@ -20,6 +23,7 @@ pub mod landlock;
 pub mod lease;
 pub mod messages;
 pub mod paths;
+pub mod policy;
 pub mod predict;
 pub mod proto;
 pub mod resources;

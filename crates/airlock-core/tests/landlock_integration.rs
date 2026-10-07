@@ -27,12 +27,16 @@ fn restrict_grants_listed_and_denies_others() {
     let reg = file_root.join("existing.txt");
     std::fs::write(&reg, b"orig").unwrap();
 
-    // 目录 + /dev 整树（/dev/null 是字符设备，只能经由父目录授权）+ 普通文件
-    restrict_write_except(&[
-        allowed.clone(),
-        reg.clone(),
-        Path::new("/dev").to_path_buf(),
-    ])
+    // 目录 + /dev 整树（/dev/null 是字符设备，只能经由父目录授权）+ 普通文件；
+    // 无政策拒绝（F12 减法不触发，行为与 v0.x 一致）
+    restrict_write_except(
+        &[
+            allowed.clone(),
+            reg.clone(),
+            Path::new("/dev").to_path_buf(),
+        ],
+        &[],
+    )
     .expect("restrict with mixed rules");
 
     // 放行路径可写

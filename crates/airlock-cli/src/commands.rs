@@ -130,6 +130,7 @@ pub fn claim(
     glob_pattern: &str,
     intent: Option<&str>,
     ttl: Option<&str>,
+    cred: Option<&str>,
 ) -> Result<i32> {
     let (agent, session) = ctx.session()?;
     let mut c = ctx.client()?;
@@ -147,6 +148,9 @@ pub fn claim(
             .ok_or_else(|| Error::Config(format!("--ttl 无法解析：{t}（如 30m / 1h / 1800）")))?;
         params["ttl_s"] = serde_json::json!(secs);
     }
+    if let Some(res) = cred {
+        params["cred"] = serde_json::json!(res);
+    }
     let v = c.call("claim", &params)?;
     let ok: ClaimOk = serde_json::from_value(v)?;
     if ctx.out.json {
@@ -160,6 +164,13 @@ pub fn claim(
         ok.lease.glob
     );
     ctx.out.println_stdout(&line);
+    if let Some(creds) = &ok.credentials {
+        ctx.out.println_stdout(&ctx.out.green(&format!(
+            "✓ 凭据 {} 项已随租约发放（{}）：释放即吊销",
+            creds.len(),
+            creds.keys().cloned().collect::<Vec<_>>().join(", ")
+        )));
+    }
     if ok.prediction.risk != "none" {
         ctx.out.println_stdout(&ctx.out.yellow(&format!(
             "⚠ 预测：{}（涉及租约 {}）——同目录语义冲突高发，建议确认分工",
@@ -521,6 +532,187 @@ pub fn doctor(ctx: &Ctx) -> Result<i32> {
     }
     // doctor 恒为可用状态，退出码 0（AC2.3：探测报告不是错误）
     Ok(0)
+}
+
+// ---------- policy（F12） ----------
+
+pub fn policy_check(
+    ctx: &Ctx,
+    glob: Option<&str>,
+    agent: Option<&str>,
+    ttl: Option<i64>,
+) -> Result<i32> {
+    use airlock_core::policy::Policy;
+    let path = Policy::path_for(&ctx.domain.root);
+    if !path.exists() {
+        let msg = format!(
+            "未配置政策文件（{}）——零配置默认全放行（P3：政策是进阶而非门槛）",
+            path.display()
+        );
+        if ctx.out.json {
+            println!("{}", serde_json::json!({ "policy": null, "message": msg }));
+        } else {
+            ctx.out.println_stdout(&ctx.out.grey(&msg));
+        }
+        return Ok(0);
+    }
+    let policy = Policy::load(&ctx.domain.root)?;
+    let policy = policy.expect("文件存在时 load 必返回 Some");
+    let sha = Policy::file_sha256(&ctx.domain.root).unwrap_or_default();
+    let dirty = Policy::uncommitted_changes(&ctx.domain.root);
+    let agent_id = agent.unwrap_or("cli").to_string();
+    let verdict = glob.map(|g| {
+        let v = policy.evaluate(&agent_id, g, ttl.unwrap_or(1800));
+        (g, v)
+    });
+    if ctx.out.json {
+        let v = serde_json::json!({
+            "policy_file": path,
+            "sha256": sha,
+            "uncommitted": dirty,
+            "default_action": policy.default_action,
+            "agents_allow": policy.agents_allow,
+            "deny_rules": policy.deny_rules.iter().map(|r| serde_json::json!({"glob": r.glob, "value": r.value})).collect::<Vec<_>>(),
+            "allow_rules": policy.allow_rules.iter().map(|r| serde_json::json!({"glob": r.glob, "value": r.value})).collect::<Vec<_>>(),
+            "max_ttl_s": policy.max_ttl_s,
+            "verdict": verdict.map(|(g, v)| serde_json::json!({
+                "glob": g,
+                "agent": agent_id,
+                "allowed": v.allowed,
+                "deny_kind": v.deny.as_ref().map(|d| d.kind()),
+                "deny_rule": v.deny.as_ref().map(|d| d.rule()),
+                "ttl_cap": v.ttl_cap,
+            })),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(0);
+    }
+    ctx.out
+        .println_stdout(&format!("AIRLOCK POLICY —— {}", path.display()));
+    ctx.out.println_stdout(&format!("  sha256: {sha}"));
+    if dirty == Some(true) {
+        ctx.out.println_stdout(
+            &ctx.out
+                .yellow("  ⚠ 政策文件有未提交改动——政策变更需 commit 才可审计（PRD §4.7）"),
+        );
+    }
+    ctx.out.println_stdout(&format!(
+        "  默认动作: {} · agent 白名单: {} · TTL 上限: {}",
+        policy.default_action,
+        if policy.agents_allow.is_empty() {
+            "不限".into()
+        } else {
+            policy.agents_allow.join(", ")
+        },
+        policy
+            .max_ttl_s
+            .map(|s| format!("{s}s"))
+            .unwrap_or_else(|| "不限".into()),
+    ));
+    for r in &policy.deny_rules {
+        ctx.out
+            .println_stdout(&ctx.out.red(&format!("  deny  {:<24} {}", r.glob, r.value)));
+    }
+    for r in &policy.allow_rules {
+        ctx.out.println_stdout(
+            &ctx.out
+                .green(&format!("  allow {:<24} {}", r.glob, r.value)),
+        );
+    }
+    let mut code = 0;
+    if let Some((g, v)) = verdict {
+        let line = if v.allowed {
+            ctx.out.green(&format!(
+                "  ✓ 干跑 {}（agent={}）：允许{}",
+                g,
+                agent_id,
+                v.ttl_cap
+                    .map(|c| format!("，TTL 钳制到 {c}s"))
+                    .unwrap_or_default()
+            ))
+        } else {
+            code = 2;
+            ctx.out.red(&format!(
+                "  ✗ 干跑 {}（agent={}）：拒绝（{}，规则 {}）",
+                g,
+                agent_id,
+                v.deny.as_ref().map(|d| d.kind()).unwrap_or(""),
+                v.deny.as_ref().map(|d| d.rule()).unwrap_or("")
+            ))
+        };
+        ctx.out.println_stdout(&line);
+    }
+    Ok(code)
+}
+
+// ---------- creds（F13） ----------
+
+pub fn creds(ctx: &Ctx, cmd: &crate::CredsCmd) -> Result<i32> {
+    let mut c = ctx.client()?;
+    match cmd {
+        crate::CredsCmd::List { lease } => {
+            let v = c.call("creds_list", &serde_json::json!({ "lease_id": lease }))?;
+            if ctx.out.json {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(0);
+            }
+            let rows = v.as_array().cloned().unwrap_or_default();
+            if rows.is_empty() {
+                ctx.out
+                    .println_stdout(&ctx.out.grey("  （无凭据发放记录）"));
+                return Ok(0);
+            }
+            for r in &rows {
+                let id = r.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                let status = r.get("status").and_then(|x| x.as_str()).unwrap_or("");
+                let backend = r.get("backend").and_then(|x| x.as_str()).unwrap_or("");
+                let resource = r.get("resource").and_then(|x| x.as_str()).unwrap_or("");
+                let lease = r
+                    .get("lease_id")
+                    .and_then(|x| x.as_str())
+                    .map(short_id)
+                    .unwrap_or_else(|| "-".into());
+                let env_keys = r
+                    .get("meta")
+                    .and_then(|m| m.get("env_keys"))
+                    .and_then(|k| k.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let status_disp = if status == "active" {
+                    ctx.out.green(status)
+                } else {
+                    ctx.out.grey(status)
+                };
+                ctx.out.println_stdout(&format!(
+                    "  {} {status_disp} backend={backend} resource={resource} lease={lease} env=[{env_keys}]",
+                    short_id(id),
+                ));
+            }
+            Ok(0)
+        }
+        crate::CredsCmd::Revoke { cred_id } => {
+            let v = c.call(
+                "creds_revoke",
+                &serde_json::json!({ "cred_id": cred_id, "agent_id": std::env::var("AIRLOCK_AGENT_ID").unwrap_or_else(|_| "cli".into()) }),
+            )?;
+            let revoked = v.get("revoked").and_then(|x| x.as_bool()).unwrap_or(false);
+            if revoked {
+                ctx.out
+                    .either(&v, &ctx.out.green(&format!("✓ 已吊销凭据 {cred_id}")));
+                Ok(0)
+            } else {
+                ctx.out.println_stdout(&ctx.out.yellow(&format!(
+                    "凭据 {cred_id} 已不是 active 状态（无需重复吊销）"
+                )));
+                Ok(0)
+            }
+        }
+    }
 }
 
 // ---------- board ----------

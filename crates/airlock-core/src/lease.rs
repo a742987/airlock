@@ -69,6 +69,74 @@ pub fn claim(store: &Store, cfg: &Config, p: &ClaimParams) -> Result<ClaimOk> {
 fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result<ClaimOk> {
     store.audit("claim", &p.actor, &p.glob, None, &p.layer, None)?;
 
+    // F12 政策即代码：claim 时求值，优先于冲突检测（政策是门槛，不是建议）。
+    // 文件不存在 = 全放行（P3）；存在但非法 → Config 错（fail-closed，绝不静默放行）。
+    let policy = match p.root.as_deref() {
+        Some(root) => crate::policy::Policy::load(root)?,
+        None => None,
+    };
+    let verdict = policy
+        .as_ref()
+        .map(|pol| pol.evaluate(&p.agent_id, &p.glob, ttl));
+    if let Some(v) = &verdict {
+        if let Some(deny) = &v.deny {
+            let sha = p
+                .root
+                .as_deref()
+                .and_then(crate::policy::Policy::file_sha256);
+            store.audit(
+                "policy_deny",
+                &p.actor,
+                &p.glob,
+                None,
+                &p.layer,
+                Some(&serde_json::json!({
+                    "kind": deny.kind(),
+                    "rule": deny.rule(),
+                    "policy_sha256": sha,
+                })),
+            )?;
+            return Err(Error::Conflict(Box::new(Rejection {
+                error: "policy".into(),
+                path: p.glob.clone(),
+                holder: None,
+                ttl_remaining_s: 0,
+                free_alternatives: vec![],
+                suggested_action: messages::suggested_action::POLICY_DENIED_ADJUST_SCOPE.into(),
+                degraded: false,
+                human: messages::policy_rejection_human(
+                    &p.glob,
+                    &p.agent_id,
+                    deny.kind(),
+                    deny.rule(),
+                ),
+                deny_count: 0,
+                policy: Some(crate::proto::PolicyViolation {
+                    rule: deny.rule().to_string(),
+                    kind: deny.kind().to_string(),
+                }),
+            })));
+        }
+    }
+    // 政策 TTL 上限：clamp 而非拒绝，钳制事实入审计
+    let ttl = match &verdict {
+        Some(v) => match v.ttl_cap {
+            Some(cap) if cap < ttl => {
+                store.audit(
+                    "policy_clamp",
+                    &p.actor,
+                    &p.glob,
+                    None,
+                    &p.layer,
+                    Some(&serde_json::json!({ "requested_ttl_s": ttl, "clamped_to_s": cap })),
+                )?;
+                cap
+            }
+            _ => ttl,
+        },
+        None => ttl,
+    };
+
     // 同会话对重叠路径的重复 claim → 幂等返回既有租约（不误伤自己的 deny_count）
     let actives = store.active_leases(Some(&p.conflict_domain), now_ts)?;
     if let Some(existing) = actives
@@ -82,6 +150,7 @@ fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result
                 with_leases: vec![],
                 involved_symbols: vec![],
             },
+            credentials: None,
         });
     }
 
@@ -172,7 +241,11 @@ fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result
         }
         None => crate::predict::predict_simple(&actives, &p.glob),
     };
-    Ok(ClaimOk { lease, prediction })
+    Ok(ClaimOk {
+        lease,
+        prediction,
+        credentials: None,
+    })
 }
 
 fn build_rejection(
@@ -207,6 +280,7 @@ fn build_rejection(
         degraded: false,
         human,
         deny_count,
+        policy: None,
     }
 }
 
@@ -344,6 +418,7 @@ fn check_ownership(lease: &LeaseInfo, expected_session: Option<&str>) -> Result<
                 short_session(want)
             ),
             deny_count: 0,
+            policy: None,
         })));
     }
     Ok(())
@@ -497,8 +572,8 @@ fn find_overlapping_files(
     result
 }
 
-/// 简单的目录遍历（不跟随符号链接，限制深度）。
-fn walkdir_simple(root: &std::path::Path, max_depth: usize) -> Vec<std::path::PathBuf> {
+/// 简单的目录遍历（不跟随符号链接，限制深度）。policy 的 deny 目录解析复用。
+pub(crate) fn walkdir_simple(root: &std::path::Path, max_depth: usize) -> Vec<std::path::PathBuf> {
     let mut result = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {

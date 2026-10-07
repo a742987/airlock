@@ -15,6 +15,10 @@ pub mod suggested_action {
     pub const RETRY_AFTER_RECONNECT: &str = "retry_after_degraded_reconnect";
     /// 操作对象（租约）不属于本会话——v0.x 扩展词（v1.0 前纳入冻结表）
     pub const LEASE_NOT_OWNED_BY_SESSION: &str = "lease_not_owned_by_session";
+    /// F12：政策拒绝——申请政策允许的路径，或由管理员修订 airlock.policy.toml（变更需 commit）
+    pub const POLICY_DENIED_ADJUST_SCOPE: &str = "policy_denied_adjust_scope";
+    /// F13：凭据资源不存在或后端不可用——核对 airlock.toml [credentials] 与凭据源文件
+    pub const CREDENTIAL_UNAVAILABLE: &str = "credential_unavailable";
 }
 
 pub const SQLITE_CORRUPT: &str = "SQLite 数据库损坏，airlockd 拒绝启动（宁可不可用，不可假保护）。\
@@ -49,10 +53,34 @@ pub fn rejection_human(
         suggested_action::LEASE_NOT_OWNED_BY_SESSION => {
             "请使用持有该租约的会话操作，或先由持有方 release"
         }
+        suggested_action::POLICY_DENIED_ADJUST_SCOPE => {
+            "本路径被 airlock.policy.toml 拒绝：改做政策允许的路径，或请管理员修订政策（变更需 commit）"
+        }
+        suggested_action::CREDENTIAL_UNAVAILABLE => {
+            "凭据资源不可用：核对 airlock.toml [credentials] 配置与凭据源文件中的资源名"
+        }
         _ => "查看 airlock status 了解当前租约",
     };
     format!(
         "✗ 无法 claim {path} —— 该路径由 {agent}（会话 {session}）持有，{when}。\n  建议：{advice}。"
+    )
+}
+
+/// F12 政策拒绝的人类可读模板（与冲突拒绝区分：责任在政策而非其他 agent）。
+pub fn policy_rejection_human(glob: &str, agent: &str, kind: &str, rule: &str) -> String {
+    let why = match kind {
+        "agent_not_allowed" => format!(
+            "政策不允许 agent「{agent}」claim（airlock.policy.toml 的 [agents] allow 白名单未包含）"
+        ),
+        "path_denied" => format!("政策 deny 规则 `{rule}` 命中该路径"),
+        "allowlist_miss" => {
+            "政策为白名单模式（[paths.allow]），该路径未命中任何 allow 规则（或 agent 不在规则名单内）".to_string()
+        }
+        "default_deny" => "政策默认动作是 deny（[defaults] action），该路径未获得任何 allow 规则豁免".to_string(),
+        other => format!("政策规则 `{rule}`（{other}）"),
+    };
+    format!(
+        "✗ 无法 claim {glob} —— 被政策拒绝（policy）。\n  {why}。\n  建议：改做政策允许的路径，或请管理员修订 airlock.policy.toml（变更需 commit 才可审计）。"
     )
 }
 

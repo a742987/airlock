@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
-use crate::proto::{Actor, AuditEntry, BoardEntry, LeaseInfo, PortInfo, SessionInfo};
+use crate::proto::{Actor, AuditEntry, BoardEntry, CredRow, LeaseInfo, PortInfo, SessionInfo};
 
 pub fn now() -> i64 {
     SystemTime::now()
@@ -37,7 +37,7 @@ pub const LEASE_EXPIRED: &str = "expired";
 pub const LEASE_RELEASED: &str = "released";
 pub const LEASE_REVOKED: &str = "revoked";
 
-/// 审计事件词表（v1.0 冻结，新增走 RFC）。
+/// 审计事件词表（v1.0 冻结；v2.0 新增 F12/F13 五项，见 docs/protocol.md 协议 v2 RFC 记录）。
 pub const AUDIT_EVENTS: &[&str] = &[
     "claim",
     "grant",
@@ -49,6 +49,13 @@ pub const AUDIT_EVENTS: &[&str] = &[
     "enforce_expire",
     "degrade",
     "rollback",
+    // v2.0（F12 政策即代码）
+    "policy_load",
+    "policy_deny",
+    "policy_clamp",
+    // v2.0（F13 凭据作用域代理）
+    "cred_issue",
+    "cred_revoke",
 ];
 
 impl Store {
@@ -143,8 +150,28 @@ impl Store {
                 count INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (session_id, path)
             );
+            CREATE TABLE IF NOT EXISTS credentials (
+                id TEXT PRIMARY KEY,
+                lease_id TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                resource TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                issued_at INTEGER NOT NULL,
+                expires_at INTEGER,
+                revoked_at INTEGER,
+                meta TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_credentials_lease ON credentials(lease_id);
+            CREATE INDEX IF NOT EXISTS idx_credentials_status ON credentials(status);
             "#,
         )?;
+        // schema 版本标记（v2.0 起）：只升不降，供未来迁移框架使用
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('schema_version', '2')
+             ON CONFLICT(key) DO NOTHING",
+            [],
+        )
+        .ok();
         Ok(Store { conn, anchor_path })
     }
 
@@ -733,6 +760,66 @@ impl Store {
         Ok(rows)
     }
 
+    // ---------- 凭据（F13，协议 v2） ----------
+
+    pub fn insert_credential(&self, c: &CredRow) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO credentials(id, lease_id, backend, resource, status, issued_at, expires_at, revoked_at, meta)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                c.id,
+                c.lease_id,
+                c.backend,
+                c.resource,
+                c.status,
+                c.issued_at,
+                c.expires_at,
+                c.revoked_at,
+                c.meta.as_ref().map(|m| m.to_string())
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_credential(&self, id: &str) -> Result<Option<CredRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, lease_id, backend, resource, status, issued_at, expires_at, revoked_at, meta
+             FROM credentials WHERE id = ?1",
+        )?;
+        let rows = cred_from_query(&mut stmt, params![id])?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// 列出凭据（lease_id 过滤可选）。
+    pub fn list_credentials(&self, lease_id: Option<&str>) -> Result<Vec<CredRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, lease_id, backend, resource, status, issued_at, expires_at, revoked_at, meta
+             FROM credentials WHERE (?1 IS NULL OR lease_id = ?1) ORDER BY issued_at DESC",
+        )?;
+        cred_from_query(&mut stmt, params![lease_id])
+    }
+
+    /// 吊销标记。返回是否确有 active 凭据被标记。
+    pub fn mark_credential_revoked(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE credentials SET status = 'revoked', revoked_at = ?2
+             WHERE id = ?1 AND status = 'active'",
+            params![id, now()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 待吊销凭据：仍为 active 但所属租约已不再 active（released/expired/revoked）。
+    /// sweeper 每秒调用——凭据随租约吊销的 ≤60s 验收由此结构性保证。
+    pub fn credentials_to_revoke(&self) -> Result<Vec<CredRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.lease_id, c.backend, c.resource, c.status, c.issued_at, c.expires_at, c.revoked_at, c.meta
+             FROM credentials c JOIN leases l ON c.lease_id = l.id
+             WHERE c.status = 'active' AND l.state != 'active'",
+        )?;
+        cred_from_query(&mut stmt, params![])
+    }
+
     // ---------- 拒绝计数（AC4.3） ----------
 
     pub fn bump_deny_count(&self, session_id: &str, path: &str) -> Result<u32> {
@@ -804,6 +891,30 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn cred_from_query(
+    stmt: &mut rusqlite::Statement,
+    p: impl rusqlite::Params,
+) -> Result<Vec<CredRow>> {
+    let rows = stmt
+        .query_map(p, |r| {
+            Ok(CredRow {
+                id: r.get(0)?,
+                lease_id: r.get(1)?,
+                backend: r.get(2)?,
+                resource: r.get(3)?,
+                status: r.get(4)?,
+                issued_at: r.get(5)?,
+                expires_at: r.get(6)?,
+                revoked_at: r.get(7)?,
+                meta: r
+                    .get::<_, Option<String>>(8)?
+                    .and_then(|m| serde_json::from_str(&m).ok()),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn lease_from_row_query(

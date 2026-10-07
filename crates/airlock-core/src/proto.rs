@@ -12,7 +12,7 @@ pub const PROTOCOL_VERSION: i64 = 1;
 /// 409 型结构化拒绝。三要素：holder / ttl_remaining_s / suggested_action。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Rejection {
-    pub error: String, // "conflict" | "degraded" | ...
+    pub error: String, // "conflict" | "degraded" | "policy" | ...
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub holder: Option<Holder>,
@@ -25,6 +25,18 @@ pub struct Rejection {
     /// AC4.3：同路径被拒次数（≥3 时 suggested_action 升级）
     #[serde(default)]
     pub deny_count: u32,
+    /// F12：政策拒绝细节（协议 v2 additive；error = "policy" 时存在）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyViolation>,
+}
+
+/// F12 政策违规细节（协议 v2）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PolicyViolation {
+    /// 命中的政策规则（glob）；agent/默认拒绝时为 `<agents.allow>` 等说明性占位
+    pub rule: String,
+    /// agent_not_allowed | path_denied | allowlist_miss | default_deny
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,6 +86,9 @@ pub struct Prediction {
 pub struct ClaimOk {
     pub lease: LeaseInfo,
     pub prediction: Prediction,
+    /// F13：随租约发放的凭据（env 变量名 → 值）；未请求凭据时为 None（协议 v2 additive）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<std::collections::BTreeMap<String, String>>,
 }
 
 // ---------- 会话与资源 ----------
@@ -97,6 +112,29 @@ pub struct PortInfo {
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_until: Option<i64>,
+}
+
+// ---------- F13 凭据（协议 v2） ----------
+
+/// 凭据发放记录。`meta` 内含后端句柄（如 vault lease_id）与发放时的 env——
+/// 数据库位于 `<git-common-dir>/airlock/`（本机信任域，与凭据源文件同级）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredRow {
+    pub id: String,
+    pub lease_id: String,
+    /// file / vault（后端名，与 Config.credentials_backend 对应）
+    pub backend: String,
+    /// 资源名（如测试库 app-db）
+    pub resource: String,
+    /// active / revoked
+    pub status: String,
+    pub issued_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 // ---------- 审计日志（§7.2） ----------

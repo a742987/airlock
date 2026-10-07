@@ -1,7 +1,8 @@
 //! 零配置可用的最小配置层（P3：零配置可用，深度可调）。
 //!
 //! v0.1 配置文件是可选的 TOML 子集（key = "value" / [section]，不含数组与多行）；
-//! `airlock.policy.toml` 政策引擎是 v2.0 范围，此处只预留 enforcement 键。
+//! v2.0 起支持**带引号的键**（F12 政策规则键是 glob，如 `"vault/**" = "deny"`）
+//! 与 F13 凭据代理键。`airlock.policy.toml` 的解析见 [`crate::policy`]。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -24,6 +25,14 @@ pub struct Config {
     pub telemetry: bool,
     /// Optional loopback-only TCP listener for local protocol clients. Disabled by default.
     pub listen_addr: Option<String>,
+    /// F13 凭据代理后端：off（默认，零配置）/ file（本地凭据源文件）/ vault（HashiCorp Vault 动态密钥）
+    pub credentials_backend: String,
+    /// file 后端的凭据源文件路径；空 = `<domain.dir>/credentials.toml`（运行时按域目录解析）
+    pub credentials_file: String,
+    /// vault 后端地址（如 `http://127.0.0.1:8200`）；仅 backend = vault 时必需
+    pub vault_addr: String,
+    /// vault 动态密钥角色（database/creds/<role>）；仅 backend = vault 时必需
+    pub vault_role: String,
 }
 
 impl Default for Config {
@@ -36,9 +45,16 @@ impl Default for Config {
             board_token_budget: 500,
             telemetry: false,
             listen_addr: None,
+            credentials_backend: "off".into(),
+            credentials_file: String::new(),
+            vault_addr: String::new(),
+            vault_role: String::new(),
         }
     }
 }
+
+/// 合法的凭据后端取值（F13；off = 凭据代理整体关闭）。
+const CREDENTIALS_BACKENDS: &[&str] = &["off", "file", "vault"];
 
 /// 合法的 enforcement 取值（resolve_layer 接受的全集）。
 const ENFORCEMENT_VALUES: &[&str] = &[
@@ -46,6 +62,7 @@ const ENFORCEMENT_VALUES: &[&str] = &[
 ];
 
 /// 解析极简 TOML 子集：`[section]` 与 `key = value`（字符串/整数/布尔）。
+/// v2.0 起键支持一层成对引号（F12 政策规则键是 glob，如 `"vault/**"`）。
 pub fn parse_toml_lite(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut section = String::new();
@@ -59,10 +76,11 @@ pub fn parse_toml_lite(text: &str) -> BTreeMap<String, String> {
             continue;
         }
         if let Some((k, v)) = line.split_once('=') {
+            let key_body = unquote(k.trim());
             let key = if section.is_empty() {
-                k.trim().to_string()
+                key_body
             } else {
-                format!("{}.{}", section, k.trim())
+                format!("{}.{}", section, key_body)
             };
             out.insert(key, unquote(v.trim()));
         }
@@ -95,11 +113,28 @@ impl Config {
                 }
             }
         };
-        for p in candidates {
-            let text = std::fs::read_to_string(&p)
+        for p in &candidates {
+            let text = std::fs::read_to_string(p)
                 .map_err(|e| Error::Config(format!("无法读取配置 {}: {e}", p.display())))?;
             let kv = parse_toml_lite(&text);
             cfg.apply_kv(&kv, &p.display().to_string())?;
+        }
+        // F13 交叉校验：vault 后端必须有地址与角色（fail-fast，不发到 issue 时才发现）
+        if cfg.credentials_backend == "vault" {
+            if cfg.vault_addr.is_empty() {
+                return Err(Error::Config(format!(
+                    "credentials_backend = \"vault\" 需要同时配置 vault_addr（来自 {}）",
+                    candidates
+                        .last()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "默认值".into())
+                )));
+            }
+            if cfg.vault_role.is_empty() {
+                return Err(Error::Config(
+                    "credentials_backend = \"vault\" 需要同时配置 vault_role".into(),
+                ));
+            }
         }
         Ok(cfg)
     }
@@ -144,9 +179,27 @@ impl Config {
                     }
                     self.listen_addr = Some(addr.to_string());
                 }
+                "credentials_backend" => {
+                    if !CREDENTIALS_BACKENDS.contains(&v.as_str()) {
+                        return Err(Error::Config(format!(
+                            "credentials_backend 值 `{v}` 非法（来自 {from}）；合法值：{}",
+                            CREDENTIALS_BACKENDS.join("/")
+                        )));
+                    }
+                    self.credentials_backend = v.clone();
+                }
+                "credentials_file" => {
+                    self.credentials_file = v.trim().to_string();
+                }
+                "vault_addr" => {
+                    self.vault_addr = v.trim().to_string();
+                }
+                "vault_role" => {
+                    self.vault_role = v.trim().to_string();
+                }
                 other => {
                     return Err(Error::Config(format!(
-                        "未知配置键 `{other}`（来自 {from}）；合法键：enforcement/heartbeat_s/default_ttl_s/port_base/board_token_budget/telemetry/listen_addr"
+                        "未知配置键 `{other}`（来自 {from}）；合法键：enforcement/heartbeat_s/default_ttl_s/port_base/board_token_budget/telemetry/listen_addr/credentials_backend/credentials_file/vault_addr/vault_role"
                     )))
                 }
             }

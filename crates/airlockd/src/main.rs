@@ -33,6 +33,87 @@ fn lock_store(store: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
     store.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// F13：为（新建或幂等命中的）租约挂上凭据。请求了 cred 资源时：
+/// 幂等路径优先复用该租约现存 active 凭据的 env（不重复发放）；无则新发放。
+/// 任何失败都先释放刚建立的租约再上抛（部分失败不泄漏，P1-5）。
+fn attach_credentials(
+    store: &Store,
+    d: &Daemon,
+    ok: &mut ClaimOk,
+    cred_resource: Option<String>,
+    agent_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    fn rollback_lease(store: &Store, d: &Daemon, lease_id: &str, actor: &Actor, session_id: &str) {
+        let _ = lease::release(
+            store,
+            lease_id,
+            actor,
+            &d.layer.id,
+            Some(session_id),
+            Some(&d.domain.root),
+        );
+    }
+    let Some(resource) = cred_resource else {
+        return Ok(());
+    };
+    let actor = Actor {
+        agent: agent_id.to_string(),
+        session: session_id.to_string(),
+        pid_tree: vec![],
+    };
+    let backend = match airlock_core::credentials::backend_from_config(&d.cfg, &d.domain.dir) {
+        Ok(b) => b,
+        Err(e) => {
+            rollback_lease(store, d, &ok.lease.id, &actor, session_id);
+            return Err(e);
+        }
+    };
+    let Some(backend) = backend else {
+        rollback_lease(store, d, &ok.lease.id, &actor, session_id);
+        return Err(Error::Config(
+            "请求了凭据（cred）但凭据代理未启用：airlock.toml 配置 credentials_backend = \"file\" 或 \"vault\""
+                .into(),
+        ));
+    };
+    // 幂等/重复 claim：复用该租约现存 active 凭据的 env；无则新发放
+    let mut reused = std::collections::BTreeMap::new();
+    if let Ok(rows) = store.list_credentials(Some(&ok.lease.id)) {
+        for r in rows {
+            if r.status != "active" || r.resource != resource {
+                continue;
+            }
+            if let Some(env) = r.meta.as_ref().and_then(|m| m.get("env")) {
+                if let Ok(map) = serde_json::from_value::<std::collections::BTreeMap<String, String>>(
+                    env.clone(),
+                ) {
+                    reused.extend(map);
+                }
+            }
+        }
+    }
+    if !reused.is_empty() {
+        ok.credentials = Some(reused);
+        return Ok(());
+    }
+    let scope = airlock_core::credentials::CredScope {
+        lease_id: ok.lease.id.clone(),
+        agent_id: agent_id.to_string(),
+        resource,
+        ttl_s: ok.lease.ttl_s,
+    };
+    match airlock_core::credentials::issue_for_lease(store, backend.as_ref(), &scope) {
+        Ok(env) => {
+            ok.credentials = Some(env);
+            Ok(())
+        }
+        Err(e) => {
+            rollback_lease(store, d, &ok.lease.id, &actor, session_id);
+            Err(e)
+        }
+    }
+}
+
 struct Daemon {
     store: Arc<Mutex<Store>>,
     domain: Domain,
@@ -172,6 +253,27 @@ fn main() {
     {
         let s = lock_store(&daemon.store);
         let _ = s.meta_set("boot_ts", &daemon.started_at.to_string());
+        // F12：审计当前生效政策（含 sha256；政策文件入库即可审计）。
+        // 政策存在且非法 → 拒绝启动（fail-closed，与 claim 层口径一致）。
+        match airlock_core::policy::Policy::load(&daemon.domain.root) {
+            Ok(Some(_)) => {
+                let policy_path = airlock_core::policy::Policy::path_for(&daemon.domain.root);
+                let sha = airlock_core::policy::Policy::file_sha256(&daemon.domain.root);
+                let _ = s.audit(
+                    "policy_load",
+                    &Actor::default(),
+                    &policy_path.to_string_lossy(),
+                    None,
+                    &daemon.layer.id,
+                    Some(&serde_json::json!({ "sha256": sha })),
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(5);
+            }
+        }
         let recovered = lease::sweep_all(
             &s,
             &daemon.layer.id,
@@ -221,13 +323,15 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    // 过期清扫线程：1s 周期（FR1.3 / FR3.3 / AC3.3）。
+    // 过期清扫线程：1s 周期（FR1.3 / FR3.3 / AC3.3 / F13 ≤60s 吊销）。
     // 退出统一由主循环驱动（SHUTDOWN → 清理 → 进程退出），清扫线程不 exit。
     {
         let store = Arc::clone(&daemon.store);
         let layer_id = daemon.layer.id.clone();
         let session_root = daemon.domain.dir.join("sessions");
         let domain_root = daemon.domain.root.clone();
+        let cred_cfg = daemon.cfg.clone();
+        let cred_dir = daemon.domain.dir.clone();
         std::thread::spawn(move || loop {
             // try_lock：WouldBlock（本周期跳过）与中毒（恢复继续清扫）分开处理
             let guard = match store.try_lock() {
@@ -238,6 +342,12 @@ fn main() {
             if let Some(s) = guard {
                 let _ = lease::sweep_all(&s, &layer_id, &session_root, Some(&domain_root));
                 let _ = resources::sweep_cooldowns(&s);
+                // F13：租约已不活跃的凭据 → 后端吊销（1s 周期 ⇒ ≤60s 结构性保证）
+                if let Ok(Some(_)) =
+                    airlock_core::credentials::backend_from_config(&cred_cfg, &cred_dir)
+                {
+                    let _ = airlock_core::credentials::sweep_revocations(&s, &cred_cfg, &cred_dir);
+                }
             }
             std::thread::sleep(Duration::from_secs(1));
         });
@@ -474,8 +584,8 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                 }
                 let params = lease::ClaimParams {
                     conflict_domain: d.domain.id.clone(),
-                    agent_id,
-                    session_id,
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
                     glob,
                     intent: opt_str(p, "intent"),
                     ttl_s: p.get("ttl_s").and_then(|v| v.as_i64()),
@@ -487,7 +597,16 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                     actor: actor_from(p),
                     root: Some(d.domain.root.clone()),
                 };
-                let ok: ClaimOk = lease::claim(&store, &d.cfg, &params)?;
+                let mut ok: ClaimOk = lease::claim(&store, &d.cfg, &params)?;
+                // F13：按需发放凭据（失败回滚租约，部分失败不泄漏）
+                attach_credentials(
+                    &store,
+                    d,
+                    &mut ok,
+                    opt_str(p, "cred"),
+                    &agent_id,
+                    &session_id,
+                )?;
                 Ok(serde_json::to_value(&ok)?)
             }
             "ensure_claim" => {
@@ -508,20 +627,30 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                     let mut renewed = existing.clone();
                     renewed.last_heartbeat = now_ts;
                     renewed.expires_at = now_ts + existing.ttl_s;
-                    let ok = ClaimOk {
+                    let mut ok = ClaimOk {
                         lease: renewed,
                         prediction: airlock_core::proto::Prediction {
                             risk: "none".into(),
                             with_leases: vec![],
                             involved_symbols: vec![],
                         },
+                        credentials: None,
                     };
+                    // F13：幂等路径同样支持凭据请求（复用现存 active 凭据或补发）
+                    attach_credentials(
+                        &store,
+                        d,
+                        &mut ok,
+                        opt_str(p, "cred"),
+                        &agent_id,
+                        &session_id,
+                    )?;
                     return Ok(serde_json::to_value(&ok)?);
                 }
                 let params = lease::ClaimParams {
                     conflict_domain: d.domain.id.clone(),
-                    agent_id,
-                    session_id,
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
                     glob,
                     intent: opt_str(p, "intent"),
                     ttl_s: p.get("ttl_s").and_then(|v| v.as_i64()),
@@ -533,7 +662,15 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                     actor: actor_from(p),
                     root: Some(d.domain.root.clone()),
                 };
-                let ok: ClaimOk = lease::claim(&store, &d.cfg, &params)?;
+                let mut ok: ClaimOk = lease::claim(&store, &d.cfg, &params)?;
+                attach_credentials(
+                    &store,
+                    d,
+                    &mut ok,
+                    opt_str(p, "cred"),
+                    &agent_id,
+                    &session_id,
+                )?;
                 Ok(serde_json::to_value(&ok)?)
             }
             "release" => {
@@ -746,6 +883,35 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                     Some(&serde_json::json!({ "reason": str_or(p, "reason", "") })),
                 )?;
                 Ok(serde_json::json!({ "logged": true }))
+            }
+            "creds_list" => {
+                // F13：凭据清单（meta 脱敏：env 值替换为变量名清单）
+                let lease_id = opt_str(p, "lease_id");
+                let rows = store.list_credentials(lease_id.as_deref())?;
+                let sanitized: Vec<airlock_core::proto::CredRow> = rows
+                    .iter()
+                    .map(airlock_core::credentials::sanitize_row)
+                    .collect();
+                Ok(serde_json::to_value(&sanitized)?)
+            }
+            "creds_revoke" => {
+                // F13：立即吊销（管理员）；后端以凭据记录的 backend 为准
+                let cred_id = str_or(p, "cred_id", "");
+                if cred_id.is_empty() {
+                    return Err(Error::Config("creds_revoke 需要 cred_id".into()));
+                }
+                let row = store
+                    .get_credential(&cred_id)?
+                    .ok_or_else(|| Error::NotFound(format!("凭据 {cred_id} 不存在")))?;
+                let backend = airlock_core::credentials::backend_by_name(
+                    &d.cfg,
+                    &d.domain.dir,
+                    &row.backend,
+                )?
+                .ok_or_else(|| Error::Config(format!("凭据后端 `{}` 不可用", row.backend)))?;
+                let revoked =
+                    airlock_core::credentials::revoke_one(&store, backend.as_ref(), &cred_id)?;
+                Ok(serde_json::json!({ "revoked": revoked }))
             }
             "stop" => {
                 SHUTDOWN.store(true, Ordering::SeqCst);
