@@ -258,6 +258,13 @@ pub fn backend_by_name(
                     domain_dir.join(p)
                 }
             };
+            // 凭据源文件收紧为 0600（通常由本用户创建，失败仅忽略——
+            // 域目录本身已是 0700）
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
             Ok(Some(Box::new(FileBackend { path })))
         }
         "vault" => {
@@ -266,8 +273,16 @@ pub fn backend_by_name(
                     "凭据记录引用 vault 后端，但 airlock.toml 未配置 vault_addr/vault_role".into(),
                 ));
             }
+            // http:// 明文传输 X-Vault-Token：仅回环地址可接受，否则显式警告
+            let addr = cfg.vault_addr.clone();
+            if addr.starts_with("http://") && !is_loopback_http_addr(&addr) {
+                eprintln!(
+                    "⚠ vault_addr 使用明文 http://（{}）：VAULT_TOKEN 将以明文传输，仅建议在受信任的本机/隔离网络使用",
+                    addr
+                );
+            }
             Ok(Some(Box::new(VaultBackend {
-                addr: cfg.vault_addr.clone(),
+                addr,
                 role: cfg.vault_role.clone(),
                 token: std::env::var("VAULT_TOKEN").ok().filter(|t| !t.is_empty()),
             })))
@@ -276,6 +291,18 @@ pub fn backend_by_name(
             "未知凭据后端 `{other}`（合法值：file/vault）"
         ))),
     }
+}
+
+/// http:// 地址是否指向回环（127.0.0.1 / localhost / [::1]）。
+fn is_loopback_http_addr(addr: &str) -> bool {
+    let host = addr
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 /// 发放凭据并落库 + 审计（claim 成功后由 daemon 调用）。
@@ -329,6 +356,10 @@ pub fn revoke_one(store: &Store, backend: &dyn CredBackend, cred_id: &str) -> Re
     let meta = row.meta.clone().unwrap_or(serde_json::json!({}));
     backend.revoke(&meta)?;
     store.mark_credential_revoked(cred_id)?;
+    // 凭据值不得在吊销后长期躺在数据库里（L2 只限写不限读，任何 agent
+    // 都能直读 .git/airlock/airlock.db）：吊销即清除 meta 中的 env 原文。
+    // 后端句柄保留，供审计与重试。
+    store.purge_credential_env(cred_id)?;
     store.audit(
         "cred_revoke",
         &Actor::default(),
@@ -527,6 +558,12 @@ mod tests {
         assert_eq!(sweep_revocations(&store, &cfg, &tmp).unwrap(), 1);
         let after = store.get_credential(&listed[0].id).unwrap().unwrap();
         assert_eq!(after.status, "revoked");
+        // 吊销后 meta 中的凭据明文已清除（L2 不限读，DB 文件任何 agent 可读）
+        assert!(
+            after.meta.as_ref().unwrap().get("env").is_none(),
+            "吊销后 meta.env 必须被清除：{:?}",
+            after.meta
+        );
         // 吊销后 sweep 不再命中
         assert_eq!(sweep_revocations(&store, &cfg, &tmp).unwrap(), 0);
         std::fs::remove_dir_all(&tmp).ok();

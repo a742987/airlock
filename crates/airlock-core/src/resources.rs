@@ -24,31 +24,46 @@ pub fn register_session(store: &Store, agent_id: &str, port_base: u16) -> Result
             65535 - i64::from(PORTS_PER_SESSION)
         )));
     }
-    let sessions = store.list_sessions(false)?;
-    let capacity = (65535 - port_base_i) / i64::from(PORTS_PER_SESSION) + 1;
-    let mut seq = sessions.iter().map(|s| s.seq).max().unwrap_or(-1) + 1;
-    let mut guard = 0i64;
-    let base = loop {
-        // 回绕：seq 取模容量，base 恒落在 [port_base, 65535] 内
-        let candidate = port_base_i + (seq % capacity) * i64::from(PORTS_PER_SESSION);
-        if !store.port_range_busy(candidate, i64::from(PORTS_PER_SESSION))? {
-            break candidate;
+    // 「查忙 → 插入」放进 BEGIN IMMEDIATE：多进程直开数据库并发注册
+    // 不会把同一段端口发给两个会话
+    store.begin_immediate()?;
+    let session = (|| -> Result<SessionInfo> {
+        let sessions = store.list_sessions(false)?;
+        let capacity = (65535 - port_base_i) / i64::from(PORTS_PER_SESSION) + 1;
+        let mut seq = sessions.iter().map(|s| s.seq).max().unwrap_or(-1) + 1;
+        let mut guard = 0i64;
+        let base = loop {
+            // 回绕：seq 取模容量，base 恒落在 [port_base, 65535] 内
+            let candidate = port_base_i + (seq % capacity) * i64::from(PORTS_PER_SESSION);
+            if !store.port_range_busy(candidate, i64::from(PORTS_PER_SESSION))? {
+                break candidate;
+            }
+            seq += 1;
+            guard += 1;
+            if guard >= capacity {
+                return Err(Error::Other("可用端口段耗尽".into()));
+            }
+        };
+        let session = SessionInfo {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            seq: seq % capacity,
+            port_base: base as u16,
+            env: inject_env(base as u16),
+        };
+        store.insert_session(&session)?;
+        Ok(session)
+    })();
+    match session {
+        Ok(s) => {
+            store.commit()?;
+            Ok(s)
         }
-        seq += 1;
-        guard += 1;
-        if guard >= capacity {
-            return Err(Error::Other("可用端口段耗尽".into()));
+        Err(e) => {
+            let _ = store.rollback();
+            Err(e)
         }
-    };
-    let session = SessionInfo {
-        session_id: uuid::Uuid::new_v4().to_string(),
-        agent_id: agent_id.to_string(),
-        seq: seq % capacity,
-        port_base: base as u16,
-        env: inject_env(base as u16),
-    };
-    store.insert_session(&session)?;
-    Ok(session)
+    }
 }
 
 /// FR3.1：注入 PORT / VITE_PORT / NEXT_PORT。

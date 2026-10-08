@@ -6,11 +6,14 @@
 ## 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/airlock-dev/airlock/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/a742987/airlock/main/scripts/install.sh | sh
 ```
 
 需要 Rust 1.80+（脚本会自动检查并给出 rustup 链接）；Windows 请在 WSL2 中执行。
 装完即打印下一步命令，或直接看[快速开始](#快速开始60-秒linuxmacoswsl2只演示-l1)。
+
+> 注：install.sh 固定安装最新发布 tag（当前 `v2.0.0`，按仓库内 Cargo.lock 复现构建），
+> 每次发版后脚本内的 `TAG` 变量会随之更新。
 
 > 两个 agent 单测全绿、合并互毁——《Passes Alone, Fails Together》(UMD, SPLASH/ISSTA 2026) 实测现象，
 > 也是你开两个 Claude Code 的日常。Airlock 用内核级文件租约让它**物理上不可能**发生。
@@ -205,6 +208,8 @@ airlock daemon start|stop
 - daemon 最小权限运行；L2 走内核 Landlock，无需 root；
 - 提交密钥与仓库凭据不经过 Airlock 进程（F13 只代理测试资源凭据，边界见协议规范 §3.2）；
 - 零遥测（默认关闭，且 v0.x 未实现采集）。
+
+**信任模型**：Airlock 假定单用户开发机信任模型：daemon 的 Unix socket 与 SQLite 数据目录按 0600/0700 权限保护，多用户共享机器上的其他本地用户不在信任边界内。
 
 ## 许可
 

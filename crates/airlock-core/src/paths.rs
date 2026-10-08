@@ -57,12 +57,15 @@ impl Domain {
         let is_git = common_dir.is_some();
         let common_dir = common_dir.unwrap_or_else(|| cwd.clone());
         let root = if is_git {
-            // common dir 通常是 <worktree>/.git；worktree 的 common dir 在主仓库下，
-            // 冲突域以主仓库为准（同一 common dir = 同一租约空间）。
-            common_dir
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| common_dir.clone())
+            // 冲突域 ID 以 common dir 为准（同一 common dir = 同一租约空间），
+            // 但 root 必须是**当前 worktree**：linked worktree 的 common dir
+            // 在主仓库下，取 parent 会把政策/快照/Landlock 全作用到主仓库树
+            git_worktree_root(&cwd).unwrap_or_else(|| {
+                common_dir
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| common_dir.clone())
+            })
         } else {
             cwd.clone()
         };
@@ -106,6 +109,26 @@ impl Domain {
     pub fn session_dir(&self, session_id: &str) -> PathBuf {
         self.dir.join("sessions").join(session_id)
     }
+}
+
+/// 当前 worktree 根（`git rev-parse --show-toplevel`）。
+/// linked worktree 下与 common dir 的 parent 不同——root 必须用它。
+fn git_worktree_root(cwd: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(&s);
+    let abs = if p.is_absolute() { p } else { cwd.join(p) };
+    abs.canonicalize().ok().or(Some(abs))
 }
 
 fn git_common_dir(cwd: &Path) -> Option<PathBuf> {

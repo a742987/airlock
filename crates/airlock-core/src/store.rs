@@ -62,6 +62,13 @@ impl Store {
     /// 打开（不存在则建表）。SQLite 损坏 → Integrity（daemon 拒绝启动，§8.4）。
     pub fn open(path: &Path) -> Result<Store> {
         let conn = Connection::open(path)?;
+        // DB 含租约状态、审计链与 F13 凭据 meta：文件模式 0600，
+        // 不依赖 umask（失败忽略——域目录已 0700，由 daemon 兜底）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| Error::Integrity(format!("WAL 设置失败：{e}（疑似数据库损坏）")))?;
         conn.pragma_update(None, "synchronous", "NORMAL").ok();
@@ -230,6 +237,10 @@ impl Store {
     // ---------- 审计日志（append-only，hash-chained） ----------
 
     /// 写入一条审计事件：hash = sha256(seq ‖ prev_hash ‖ ts ‖ event ‖ actor ‖ path ‖ lease_id ‖ layer ‖ detail)。
+    ///
+    /// 并发语义：事务内调用（如 claim）直接追加；事务外的调用以
+    /// `BEGIN IMMEDIATE` 包住「读 prev_hash → 算 seq → INSERT」，多进程
+    /// 直开数据库也不会算出重复 seq 或分叉的 prev_hash 链。
     pub fn audit(
         &self,
         event: &str,
@@ -244,6 +255,39 @@ impl Store {
                 "未知的审计事件 `{event}`；词表 v1.0 冻结：{AUDIT_EVENTS:?}"
             )));
         }
+        if self.conn.is_autocommit() {
+            // 事务外：串行化整条追加并在提交后刷新锚点
+            self.begin_immediate()?;
+            let r = self.audit_append(event, actor, path, lease_id, layer, detail);
+            match r {
+                Ok(e) => {
+                    self.commit()?;
+                    let _ = self.refresh_anchor();
+                    Ok(e)
+                }
+                Err(e) => {
+                    let _ = self.rollback();
+                    Err(e)
+                }
+            }
+        } else {
+            // 事务内：不写锚点（回滚后锚点会指向不存在的 hash，制造假告警）。
+            // 提交后由 claim() 等调用方 refresh_anchor()。
+            self.audit_append(event, actor, path, lease_id, layer, detail)
+        }
+    }
+
+    /// 追加一条审计记录（不管理事务与锚点）。
+    #[allow(clippy::too_many_arguments)]
+    fn audit_append(
+        &self,
+        event: &str,
+        actor: &Actor,
+        path: &str,
+        lease_id: Option<&str>,
+        layer: &str,
+        detail: Option<&serde_json::Value>,
+    ) -> Result<AuditEntry> {
         let ts = now();
         let prev_hash: String = self
             .conn
@@ -294,10 +338,6 @@ impl Store {
                 }
             ],
         )?;
-        // 尾部锚点：写盘失败仅降级（链校验仍覆盖中间篡改）
-        if let Some(anchor) = &self.anchor_path {
-            let _ = std::fs::write(anchor, &hash);
-        }
         Ok(AuditEntry {
             seq: next_seq,
             prev_hash,
@@ -310,6 +350,27 @@ impl Store {
             layer: layer.to_string(),
             detail: detail.cloned(),
         })
+    }
+
+    /// 事务提交后刷新审计链尾部锚点（`audit()` 在事务内不写锚点，
+    /// 避免回滚后锚点指向不存在的 hash、下次 verify 误报尾部截断）。
+    pub fn refresh_anchor(&self) -> Result<()> {
+        let Some(anchor) = &self.anchor_path else {
+            return Ok(());
+        };
+        let hash: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT hash FROM audit_log ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(h) = hash {
+            // 写盘失败仅降级（链校验仍覆盖中间篡改）
+            let _ = std::fs::write(anchor, h);
+        }
+        Ok(())
     }
 
     pub fn audit_query(&self, since_ts: Option<i64>, limit: i64) -> Result<Vec<AuditEntry>> {
@@ -446,12 +507,15 @@ impl Store {
         Ok(())
     }
 
-    pub fn update_lease_state(&self, id: &str, state: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE leases SET state = ?2 WHERE id = ?1",
+    /// 状态转移守卫：仅当租约仍为 active 时才生效（sweeper 与 release 的
+    /// check-then-act 竞态不会互相覆盖）。返回 false = 租约不存在或已被
+    /// 并发路径终结（调用方应视为「无事可做」而非错误）。
+    pub fn update_lease_state(&self, id: &str, state: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE leases SET state = ?2 WHERE id = ?1 AND state = 'active'",
             params![id, state],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     pub fn update_lease_heartbeat(
@@ -467,31 +531,20 @@ impl Store {
         Ok(())
     }
 
-    /// F6：更新租约的 token 消耗和成本。使用饱和加法防止溢出。
+    /// F6：更新租约的 token 消耗和成本。
+    /// 单语句原子累加：并发上报不再互相丢更新（此前先读后写会 lost update）。
     pub fn update_lease_cost(
         &self,
         id: &str,
         tokens_delta: u64,
         cost_cents_delta: u64,
     ) -> Result<()> {
-        // 先读取当前值
-        let current: (u64, u64) = self
-            .conn
-            .query_row(
-                "SELECT tokens_used, cost_cents FROM leases WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?
-            .unwrap_or((0, 0));
-
-        // 饱和加法：防止溢出回绕
-        let new_tokens = current.0.saturating_add(tokens_delta);
-        let new_cost = current.1.saturating_add(cost_cents_delta);
-
         self.conn.execute(
-            "UPDATE leases SET tokens_used = ?2, cost_cents = ?3 WHERE id = ?1",
-            params![id, new_tokens, new_cost],
+            "UPDATE leases SET
+                tokens_used = MIN(tokens_used + ?2, 9223372036854775807),
+                cost_cents = MIN(cost_cents + ?3, 9223372036854775807)
+             WHERE id = ?1",
+            params![id, tokens_delta as i64, cost_cents_delta as i64],
         )?;
         Ok(())
     }
@@ -582,17 +635,22 @@ impl Store {
             .map_err(Error::from)
     }
 
-    /// 黑板读取：活动条目 + 7 天内归档摘要，按活跃度+时间排序，token 预算截断（FR5.3 / AC5.2）。
-    pub fn board_read(&self, token_budget: usize) -> Result<crate::proto::BoardRead> {
+    /// 黑板读取：活动条目 + 归档摘要（窗口 `archive_days` 天，与 board_purge
+    /// 的保留期共用同一配置——读取窗口和清理窗口不能各说各话），token 预算截断。
+    pub fn board_read(
+        &self,
+        token_budget: usize,
+        archive_days: i64,
+    ) -> Result<crate::proto::BoardRead> {
         let mut stmt = self.conn.prepare(
             "SELECT id, lease_id, origin, body, status, created_at, archived_at
              FROM board_entries
              WHERE status = 'active'
-                OR (status = 'archived' AND archived_at >= ?1 - 7*86400)
+                OR (status = 'archived' AND archived_at >= ?1 - ?2*86400)
              ORDER BY status ASC, created_at DESC", // active 排前（'active' < 'archived'）
         )?;
         let entries: Vec<BoardEntry> = stmt
-            .query_map(params![now()], |r| {
+            .query_map(params![now(), archive_days], |r| {
                 Ok(BoardEntry {
                     id: r.get(0)?,
                     lease_id: r.get(1)?,
@@ -664,11 +722,14 @@ impl Store {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt
             .query_map([], |r| {
+                // 越界值不回绕截断（回绕会把损坏数据映射回低位端口段），
+                // 归 0 使其明显无效而非伪装合法
+                let port_base: i64 = r.get(3)?;
                 Ok(SessionInfo {
                     session_id: r.get(0)?,
                     agent_id: r.get(1)?,
                     seq: r.get(2)?,
-                    port_base: r.get::<_, i64>(3)? as u16,
+                    port_base: u16::try_from(port_base).unwrap_or(0),
                     env: Default::default(),
                 })
             })?
@@ -699,9 +760,10 @@ impl Store {
         )?;
         let rows = stmt
             .query_map([], |r| {
+                let port: i64 = r.get(1)?;
                 Ok(PortInfo {
                     session_id: r.get(0)?,
-                    port: r.get::<_, i64>(1)? as u16,
+                    port: u16::try_from(port).unwrap_or(0),
                     purpose: r.get(2)?,
                     state: r.get(3)?,
                     cooldown_until: r.get(4)?,
@@ -760,6 +822,20 @@ impl Store {
         Ok(rows)
     }
 
+    /// 崩溃会话遗留的 misc_lock（超过 cutoff 仍未释放）。
+    /// 没有 TTL 的话，一个崩溃 agent 的锁会把其他会话永久挡在门外。
+    pub fn misc_locks_older_than(&self, cutoff: i64) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, session_id FROM misc_locks WHERE acquired_at < ?1")?;
+        let rows = stmt
+            .query_map(params![cutoff], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ---------- 凭据（F13，协议 v2） ----------
 
     pub fn insert_credential(&self, c: &CredRow) -> Result<()> {
@@ -809,15 +885,28 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// 待吊销凭据：仍为 active 但所属租约已不再 active（released/expired/revoked）。
+    /// 吊销后清除 meta 中的凭据明文（env）：L2 不限制读，任何 agent 都能
+    /// 直读 DB 文件——吊销后的密钥值不能继续躺在盘上。
+    /// 后端句柄（backend 字段）保留供审计。
+    pub fn purge_credential_env(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE credentials SET meta = json_remove(meta, '$.env') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// 待吊销凭据：仍为 active，但（a）所属租约已不再 active
+    /// （released/expired/revoked），或（b）自身 expires_at 已到。
     /// sweeper 每秒调用——凭据随租约吊销的 ≤60s 验收由此结构性保证。
     pub fn credentials_to_revoke(&self) -> Result<Vec<CredRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.id, c.lease_id, c.backend, c.resource, c.status, c.issued_at, c.expires_at, c.revoked_at, c.meta
              FROM credentials c JOIN leases l ON c.lease_id = l.id
-             WHERE c.status = 'active' AND l.state != 'active'",
+             WHERE c.status = 'active'
+               AND (l.state != 'active' OR (c.expires_at IS NOT NULL AND c.expires_at <= ?1))",
         )?;
-        cred_from_query(&mut stmt, params![])
+        cred_from_query(&mut stmt, params![now()])
     }
 
     // ---------- 拒绝计数（AC4.3） ----------

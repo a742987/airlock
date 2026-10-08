@@ -1,15 +1,16 @@
-# Homebrew formula：brew tap airlock-dev/tap && brew install airlock
+# Homebrew formula：brew tap a742987/tap && brew install airlock
 #
 # v2.0.0：包含 F5 符号级冲突预测、F6 成本归因、F7 隔离回滚、
 #         F12 政策即代码（airlock.policy.toml）、F13 凭据作用域代理。
 # 打 tag 后填入 sha256 行（tarball 校验和）：
-#   curl -sL https://github.com/airlock-dev/airlock/archive/refs/tags/v2.0.0.tar.gz | shasum -a 256
+#   curl -sL https://github.com/a742987/airlock/archive/refs/tags/v2.0.0.tar.gz | shasum -a 256
+# TODO: release 后填入真实 sha256（v2.0.0 tarball）
 class Airlock < Formula
   desc "Kernel-enforced file leases for parallel AI coding agents"
-  homepage "https://github.com/airlock-dev/airlock"
-  url "https://github.com/airlock-dev/airlock/archive/refs/tags/v2.0.0.tar.gz"
+  homepage "https://github.com/a742987/airlock"
+  url "https://github.com/a742987/airlock/archive/refs/tags/v2.0.0.tar.gz"
   # sha256 "TODO_FILL_AFTER_TAGGING"
-  head "https://github.com/airlock-dev/airlock.git", branch: "main"
+  head "https://github.com/a742987/airlock.git", branch: "main"
   license any_of: ["MIT", "Apache-2.0"]
 
   depends_on "rust" => :build

@@ -14,6 +14,9 @@ use crate::commands::Ctx;
 /// 本实现支持的 MCP 协议版本（initialize 无法协商时使用）。
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// 单请求行上限：1 MiB，与 daemon 侧保持一致。
+const MAX_REQUEST_LINE: usize = 1 << 20;
+
 pub fn serve(ctx: &Ctx) -> Result<i32> {
     let session: Arc<tokio_like::OnceCell<String>> = Arc::new(tokio_like::OnceCell::new());
     let stdin = std::io::stdin();
@@ -23,6 +26,18 @@ pub fn serve(ctx: &Ctx) -> Result<i32> {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             break;
+        }
+        // 与 daemon 一致的请求行上限（超长行不处理，直接回错，防内存膨胀）
+        if line.len() > MAX_REQUEST_LINE {
+            let resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": serde_json::Value::Null,
+                "error": { "code": -32600, "message": "Request too large" }
+            });
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "{resp}")?;
+            out.flush()?;
+            continue;
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -55,15 +70,10 @@ pub fn serve(ctx: &Ctx) -> Result<i32> {
 
         let result: std::result::Result<serde_json::Value, (i64, String)> = match method.as_str() {
             "initialize" => {
-                // 回显客户端请求的版本（协议协商），未提供时用本实现支持的版本
-                let version = params
-                    .get("protocolVersion")
-                    .and_then(|p| p.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(MCP_PROTOCOL_VERSION)
-                    .to_string();
+                // MCP 协商：只声明本实现支持的版本；客户端版本不同时回自己的版本，
+                // 由客户端决定是否继续（不能无条件声称支持未知版本）
                 Ok(serde_json::json!({
-                    "protocolVersion": version,
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "airlock", "version": env!("CARGO_PKG_VERSION") }
                 }))
@@ -171,49 +181,61 @@ fn ensure_session(ctx: &Ctx, session_cell: &Arc<tokio_like::OnceCell<String>>) -
         return Ok(s);
     }
     let agent = std::env::var("AIRLOCK_AGENT_ID").unwrap_or_else(|_| "mcp-agent".into());
-    if let Ok(sid) = std::env::var("AIRLOCK_SESSION_ID") {
-        if !sid.is_empty() {
+    let env_sid = std::env::var("AIRLOCK_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let sid = match env_sid {
+        // `airlock init` 注入的会话：session 已在 daemon 侧存在，无需 register，
+        // 但自动续约线程必须在所有路径上启动——否则 init 配置的 agent 拿到的
+        // 租约会在 TTL 后静默过期，agent 以为自己仍受保护。
+        Some(sid) => {
             let _ = session_cell.set(sid.clone());
-            return Ok(sid);
+            spawn_heartbeat(ctx, sid.clone(), agent);
+            sid
         }
-    }
-    let mut c = ctx.client_or_heal()?;
-    let v = c.call("register", &serde_json::json!({ "agent_id": agent }))?;
-    let sid = v
-        .get("session_id")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| Error::Other("daemon 未返回 session_id".into()))?
-        .to_string();
-    let _ = session_cell.set(sid.clone());
-    // 后台心跳线程：为本会话全部 active 租约续约
+        None => {
+            let mut c = ctx.client_or_heal()?;
+            let v = c.call(
+                "register",
+                &serde_json::json!({ "agent_id": agent.clone() }),
+            )?;
+            let sid = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| Error::Other("daemon 未返回 session_id".into()))?
+                .to_string();
+            let _ = session_cell.set(sid.clone());
+            spawn_heartbeat(ctx, sid.clone(), agent);
+            sid
+        }
+    };
+    Ok(sid)
+}
+
+/// 后台心跳线程：为本会话全部 active 租约续约（幂等，每进程只启动一次）。
+fn spawn_heartbeat(ctx: &Ctx, sid: String, agent: String) {
     let sock = ctx.domain.socket_path();
     let heartbeat_s = ctx.cfg.heartbeat_s.max(5) as u64;
-    let sid_for_hb = sid.clone();
-    let agent_for_hb = agent.clone();
-    std::thread::spawn(move || {
-        let sid = sid_for_hb;
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(heartbeat_s));
-            let Ok(mut client) = proto::Client::connect(&sock) else {
-                continue;
-            };
-            let Ok(v) = client.call("status", &serde_json::json!({})) else {
-                continue;
-            };
-            let Ok(report) = serde_json::from_value::<StatusReport>(v) else {
-                continue;
-            };
-            for l in &report.leases {
-                if l.session_id == sid && l.state == "active" {
-                    let _ = client.call(
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(heartbeat_s));
+        let Ok(mut client) = proto::Client::connect(&sock) else {
+            continue;
+        };
+        let Ok(v) = client.call("status", &serde_json::json!({})) else {
+            continue;
+        };
+        let Ok(report) = serde_json::from_value::<StatusReport>(v) else {
+            continue;
+        };
+        for l in &report.leases {
+            if l.session_id == sid && l.state == "active" {
+                let _ = client.call(
                     "heartbeat",
-                    &serde_json::json!({ "lease_id": l.id, "agent_id": agent_for_hb, "session_id": sid }),
+                    &serde_json::json!({ "lease_id": l.id, "agent_id": agent, "session_id": sid }),
                 );
-                }
             }
         }
     });
-    Ok(sid)
 }
 
 fn tool_call(

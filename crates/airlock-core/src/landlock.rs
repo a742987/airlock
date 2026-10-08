@@ -25,6 +25,7 @@ pub const LL_FS_MAKE_SOCK: u64 = 1 << 9;
 pub const LL_FS_MAKE_SYM: u64 = 1 << 10;
 pub const LL_FS_REFER: u64 = 1 << 11; // ABI 2
 pub const LL_FS_TRUNCATE: u64 = 1 << 12; // ABI 3
+pub const LL_FS_IOCTL_DEV: u64 = 1 << 13; // ABI 4（内核 6.7+）
 
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 const LANDLOCK_RULE_PATH_BENEATH: u8 = 1;
@@ -78,6 +79,11 @@ fn handled_write_bits(abi: u32) -> u64 {
     }
     if abi >= 3 {
         bits |= LL_FS_TRUNCATE;
+    }
+    if abi >= 4 {
+        // 未处理位一律放行：ABI ≥ 4 时不纳入 IOCTL_DEV 等于允许沙箱内进程
+        // 对可打开的设备发任意 ioctl
+        bits |= LL_FS_IOCTL_DEV;
     }
     bits
 }
@@ -207,13 +213,32 @@ pub fn restrict_write_except(
     };
 
     let apply = || -> std::result::Result<(), LandlockError> {
-        // 先统一 canonicalize（老行为：不存在的路径跳过），再做政策减法——
-        // starts_with 比较必须在同一规范化坐标系上进行
-        let canon = |list: &[std::path::PathBuf]| -> Vec<std::path::PathBuf> {
+        // 先统一 canonicalize（解析符号链接，坐标系一致），再做政策减法
+        let canon_allowed = |list: &[std::path::PathBuf]| -> Vec<std::path::PathBuf> {
             list.iter().filter_map(|p| p.canonicalize().ok()).collect()
         };
-        let allowed = canon(allowed_write);
-        let denied = canon(denied_write);
+        let allowed = canon_allowed(allowed_write);
+        // deny 侧与允许侧相反：目标是「被拒子树绝不能被放行」。
+        // 不存在的 deny 目标（如尚未创建的 vault/）若直接跳过，内核会把
+        // 其父目录整树放行，agent 可 mkdir 后绕过——fail-open。这里显式
+        // 报错，调用方（airlock run）按 P2 降级 L1 并打黄色警告（fail-visible）。
+        let mut denied = Vec::new();
+        let mut missing_denied: Vec<String> = Vec::new();
+        for p in denied_write {
+            match p.canonicalize() {
+                Ok(c) => denied.push(c),
+                Err(_) => missing_denied.push(p.to_string_lossy().into_owned()),
+            }
+        }
+        if !missing_denied.is_empty() {
+            return Err(LandlockError {
+                op: "policy_deny",
+                detail: format!(
+                    "政策 deny 目标不存在，无法在内核层精确扣减（创建该路径后再运行，或调整政策）：{}",
+                    missing_denied.join(", ")
+                ),
+            });
+        }
         let (dirs, files) = subtract_denied(&allowed, &denied)?;
         let mut seen = std::collections::HashSet::new();
         for d in &dirs {

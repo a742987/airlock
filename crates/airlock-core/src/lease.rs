@@ -36,6 +36,8 @@ pub struct ClaimParams {
 ///
 /// 原子性：冲突检查与 insert 在同一 `BEGIN IMMEDIATE` 事务内完成（多进程
 /// 直开数据库也不会双授予）；冲突路径的 deny 审计随事务一并提交。
+/// 事务只包 DB 操作：git 子进程、快照写盘、全树遍历等重 IO 一律放到
+/// 事务外执行（否则慢仓库会在 SQLite 写锁内卡住所有 claim/heartbeat）。
 pub fn claim(store: &Store, cfg: &Config, p: &ClaimParams) -> Result<ClaimOk> {
     glob::validate_pattern(&p.glob).map_err(Error::Config)?;
     let now_ts = now();
@@ -53,17 +55,61 @@ pub fn claim(store: &Store, cfg: &Config, p: &ClaimParams) -> Result<ClaimOk> {
 
     store.begin_immediate()?;
     let result = claim_locked(store, p, now_ts, ttl);
-    match result {
-        // 冲突路径的 deny 审计已写入，随事务提交保留
+    match &result {
         Ok(_) | Err(Error::Conflict(_)) => {
+            // 冲突路径的 deny 审计已写入，随事务提交保留；
+            // 提交后刷新锚点（audit 在事务内不写，避免回滚后假告警）
             store.commit()?;
-            result
+            let _ = store.refresh_anchor();
         }
-        Err(e) => {
+        Err(_) => {
             let _ = store.rollback();
-            Err(e)
         }
     }
+    match result {
+        Ok(ok) => finalize_claim_success(store, p, ok, now_ts),
+        Err(Error::Conflict(mut rej)) => {
+            // free_alternatives 是 read_dir 枚举：放在事务结束后
+            if let Some(root) = p.root.as_deref() {
+                rej.free_alternatives =
+                    free_alternatives(store, root, &p.conflict_domain, &p.glob).unwrap_or_default();
+            }
+            Err(Error::Conflict(rej))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 事务提交后的收尾：F7 快照写盘 + F5 符号级预测（含 tree-sitter 文件读取）。
+/// 全部是文件系统/git 操作，放在锁外不阻塞其他客户端。
+fn finalize_claim_success(
+    store: &Store,
+    p: &ClaimParams,
+    mut ok: ClaimOk,
+    now_ts: i64,
+) -> Result<ClaimOk> {
+    if let Some(root_path) = p.root.as_deref() {
+        // 排除刚插入的本租约，否则它的 glob 恒匹配自身、把结果污染成全量
+        let actives: Vec<LeaseInfo> = store
+            .active_leases(Some(&p.conflict_domain), now_ts)?
+            .into_iter()
+            .filter(|l| l.id != ok.lease.id)
+            .collect();
+        let overlapping_files = find_overlapping_files(&actives, &p.glob, root_path);
+        let reader = |path: &std::path::Path| -> Option<String> {
+            let full = root_path.join(path);
+            std::fs::read_to_string(full).ok()
+        };
+        // F7：创建租约快照（保存在 repo root 的 .airlock/snapshots 下）
+        if let Ok(snap) = crate::snapshot::create_snapshot(root_path, &ok.lease.id) {
+            let snap_dir = root_path.join(".airlock").join("snapshots");
+            let _ = std::fs::create_dir_all(&snap_dir);
+            let _ = crate::snapshot::save_snapshot_to(&snap_dir, &snap);
+        }
+        ok.prediction =
+            crate::predict::predict(&actives, &p.glob, &overlapping_files, Some(reader));
+    }
+    Ok(ok)
 }
 
 fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result<ClaimOk> {
@@ -137,12 +183,17 @@ fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result
         None => ttl,
     };
 
-    // 同会话对重叠路径的重复 claim → 幂等返回既有租约（不误伤自己的 deny_count）
+    // 同会话重复 claim 的幂等语义：
+    // - glob 完全相同 → 幂等返回既有租约
+    // - 请求的是具体路径且已被本会话更宽的租约覆盖 → 幂等返回
+    // - 仅 overlaps 但请求更宽（持有 src/a/** 再要 src/**）绝不能复用：
+    //   返回窄租约会让 agent 误以为全 src/ 受保护。落入下方冲突检测，
+    //   持有者显示为自己会话，提示先 release 再 claim。
     let actives = store.active_leases(Some(&p.conflict_domain), now_ts)?;
-    if let Some(existing) = actives
-        .iter()
-        .find(|l| l.session_id == p.session_id && glob::overlaps(&p.glob, &l.glob))
-    {
+    if let Some(existing) = actives.iter().find(|l| {
+        l.session_id == p.session_id
+            && (l.glob == p.glob || (!p.glob.contains('*') && glob::matches(&l.glob, &p.glob)))
+    }) {
         return Ok(ClaimOk {
             lease: existing.clone(),
             prediction: crate::proto::Prediction {
@@ -163,15 +214,7 @@ fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result
         } else {
             messages::suggested_action::CLAIM_FREE_ALTERNATIVE_OR_WAIT
         };
-        let rejection = build_rejection(
-            store,
-            &p.glob,
-            other,
-            ttl_remaining,
-            action,
-            deny_count,
-            p.root.as_deref(),
-        );
+        let rejection = build_rejection(&p.glob, other, ttl_remaining, action, deny_count);
         store.audit(
             "deny",
             &p.actor,
@@ -223,24 +266,9 @@ fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result
 
     store.audit("grant", &p.actor, &p.glob, Some(&lease.id), &p.layer, None)?;
 
-    // F5：符号级冲突预测（当有 repo root 时启用 tree-sitter 分析）
-    let prediction = match p.root.as_deref() {
-        Some(root_path) => {
-            let overlapping_files = find_overlapping_files(&actives, &p.glob, root_path);
-            let reader = |path: &std::path::Path| -> Option<String> {
-                let full = root_path.join(path);
-                std::fs::read_to_string(full).ok()
-            };
-            // F7：创建租约快照（保存在 repo root 的 .airlock/snapshots 下）
-            if let Ok(snap) = crate::snapshot::create_snapshot(root_path, &lease.id) {
-                let snap_dir = root_path.join(".airlock").join("snapshots");
-                let _ = std::fs::create_dir_all(&snap_dir);
-                let _ = crate::snapshot::save_snapshot_to(&snap_dir, &snap);
-            }
-            crate::predict::predict(&actives, &p.glob, &overlapping_files, Some(reader))
-        }
-        None => crate::predict::predict_simple(&actives, &p.glob),
-    };
+    // F5：锁内先给基于租约元数据的粗分类（无 IO）；带 tree-sitter 文件
+    // 读取的完整符号级预测在事务提交后由 finalize_claim_success 覆盖
+    let prediction = crate::predict::predict_simple(&actives, &p.glob);
     Ok(ClaimOk {
         lease,
         prediction,
@@ -249,13 +277,11 @@ fn claim_locked(store: &Store, p: &ClaimParams, now_ts: i64, ttl: i64) -> Result
 }
 
 fn build_rejection(
-    store: &Store,
     path: &str,
     other: &LeaseInfo,
     ttl_remaining: i64,
     action: &str,
     deny_count: u32,
-    root: Option<&Path>,
 ) -> Rejection {
     let holder = Holder {
         agent: other.agent_id.clone(),
@@ -264,12 +290,8 @@ fn build_rejection(
     };
     let human =
         messages::rejection_human(path, &holder.agent, &holder.session, ttl_remaining, action);
-    let free_alternatives = match root {
-        Some(r) => {
-            free_alternatives(store, r, other.conflict_domain.as_str(), path).unwrap_or_default()
-        }
-        None => Vec::new(),
-    };
+    // free_alternatives 由 claim() 在事务结束后填充（read_dir 枚举不进 SQLite 写锁）
+    let free_alternatives = Vec::new();
     Rejection {
         error: "conflict".into(),
         path: path.to_string(),
@@ -357,7 +379,10 @@ pub fn release(
         }
     }
 
-    store.update_lease_state(lease_id, LEASE_RELEASED)?;
+    // 状态转移守卫：0 行说明已被并发 sweeper/release 终结，视为未释放
+    if !store.update_lease_state(lease_id, LEASE_RELEASED)? {
+        return Ok(false);
+    }
     store.archive_board_by_lease(lease_id)?;
     store.audit(
         "release",
@@ -387,7 +412,10 @@ pub fn heartbeat(
     }
     check_ownership(&lease, expected_session)?;
     let now_ts = now();
-    store.update_lease_heartbeat(lease_id, now_ts, now_ts + lease.ttl_s)?;
+    let expires_at = now_ts.checked_add(lease.ttl_s).ok_or_else(|| {
+        Error::Config(format!("TTL 越界（expires_at 溢出）：ttl={}", lease.ttl_s))
+    })?;
+    store.update_lease_heartbeat(lease_id, now_ts, expires_at)?;
     store.audit("heartbeat", actor, &lease.glob, Some(lease_id), layer, None)?;
     Ok(true)
 }
@@ -440,7 +468,10 @@ pub fn sweep(store: &Store, layer: &str, root: Option<&Path>) -> Result<Vec<Leas
             }
         }
 
-        store.update_lease_state(&lease.id, LEASE_EXPIRED)?;
+        // 状态转移守卫：并发 sweeper/lease release 已终结时不再重复归档/审计
+        if !store.update_lease_state(&lease.id, LEASE_EXPIRED)? {
+            continue;
+        }
         store.archive_board_by_lease(&lease.id)?;
         store.audit(
             "expire",
@@ -490,9 +521,19 @@ pub fn sweep_all(
 ) -> Result<Vec<LeaseInfo>> {
     let expired = sweep(store, layer, root)?;
     store.board_purge(7)?;
+    // 崩溃会话遗留的 misc_lock：24h 后强制回收，不能永久阻塞其他会话
+    for (name, holder) in store.misc_locks_older_than(now() - 24 * 3600)? {
+        let _ = store.misc_lock_release(&name, &holder);
+    }
     // AC3.3：会话结束 60s 内销毁临时资源
     let cutoff = now() - 60;
     for sid in store.session_artifacts_to_clean(cutoff)? {
+        // sid 会拼进删除路径：只处理 daemon 自签的 UUID 字符集（防御纵深——
+        // 任何往 sessions 表写入畸形 id 的路径都不能变成目录删除）
+        if !sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            store.delete_session_row(&sid)?;
+            continue;
+        }
         let dir = session_root.join(&sid);
         if dir.exists() {
             let removed = std::fs::remove_dir_all(&dir);
@@ -537,8 +578,9 @@ pub fn release_all(
     let actives = store.active_leases(None, now_ts)?;
     let mut n = 0;
     for l in actives.iter().filter(|l| l.session_id == session_id) {
-        // release_all 本身按 session 过滤，无需二次属主校验
-        if release(store, &l.id, actor, layer, None, root)? {
+        // release_all 按 session 过滤后逐条带属主校验释放——不再走
+        // expected_session=None 的旁路（None 会跳过属主检查）
+        if release(store, &l.id, actor, layer, Some(session_id), root)? {
             n += 1;
         }
     }
@@ -586,7 +628,13 @@ pub(crate) fn walkdir_simple(root: &std::path::Path, max_depth: usize) -> Vec<st
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            // read_dir 的 file_type 不解引用符号链接：symlink 到目录不会被
+            // 当作目录递归（防越出仓库根与符号链接环）
+            let is_dir = match entry.file_type() {
+                Ok(ft) => ft.is_dir(),
+                Err(_) => continue,
+            };
+            if is_dir {
                 // 跳过隐藏目录和常见大目录
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name.starts_with('.') || name == "node_modules" || name == "target" {

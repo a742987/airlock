@@ -82,10 +82,31 @@ pub fn parse_toml_lite(text: &str) -> BTreeMap<String, String> {
             } else {
                 format!("{}.{}", section, key_body)
             };
-            out.insert(key, unquote(v.trim()));
+            out.insert(key, unquote(strip_inline_comment(v.trim())));
         }
     }
     out
+}
+
+/// 剥掉行内注释：值含 ` #`（引号外）时截断到注释前。
+/// `telemetry = true # off for now` 此前会把整串当值，
+/// 布尔解析静默落 false、deny reason 混入注释文本。
+fn strip_inline_comment(v: &str) -> &str {
+    let mut in_quote: Option<char> = None;
+    let bytes = v.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match (in_quote, c) {
+            (Some(q), c2) if c2 == q => in_quote = None,
+            (None, q @ ('"' | '\'')) => in_quote = Some(q),
+            // TOML 行内注释以 # 开头；截断点之前的尾部空白一并去掉
+            (None, '#') => return v[..i].trim_end(),
+            _ => {}
+        }
+        i += 1;
+    }
+    v
 }
 
 /// 去掉一层成对引号（只剥一对，避免 `""x""` 之类被静默剥光）。
@@ -224,6 +245,17 @@ mod tests {
         assert_eq!(kv.get("airlock.enforcement").unwrap(), "off");
         assert_eq!(kv.get("airlock.heartbeat_s").unwrap(), "5");
         assert_eq!(kv.get("airlock.telemetry").unwrap(), "true");
+    }
+
+    #[test]
+    fn inline_comments_are_stripped() {
+        let kv = parse_toml_lite(
+            "telemetry = true # off for now\nname = \"a # b\" # keep hash in quotes\nreason = 'x y' # note\nnum = 5#tight\n",
+        );
+        assert_eq!(kv.get("telemetry").unwrap(), "true");
+        assert_eq!(kv.get("name").unwrap(), "a # b");
+        assert_eq!(kv.get("reason").unwrap(), "x y");
+        assert_eq!(kv.get("num").unwrap(), "5");
     }
 
     #[test]

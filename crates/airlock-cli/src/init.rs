@@ -66,7 +66,10 @@ pub fn run(ctx: &Ctx, agent: Option<&str>, undo: bool, yes: bool) -> Result<i32>
         "AIRLOCK_AGENT_ID": agent,
     });
     let hook_cmd = format!(
-        "env AIRLOCK_SESSION_ID={session_id} AIRLOCK_AGENT_ID={agent} {exe_s} hook pretooluse"
+        "env AIRLOCK_SESSION_ID={} AIRLOCK_AGENT_ID={} {} hook pretooluse",
+        shell_quote(&session_id),
+        shell_quote(agent),
+        shell_quote(&exe_s)
     );
     let hook_entry = serde_json::json!({
         "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
@@ -148,8 +151,7 @@ pub fn run(ctx: &Ctx, agent: Option<&str>, undo: bool, yes: bool) -> Result<i32>
         println!("变更摘要：新增/更新 airlock 的 MCP 配置与 PreToolUse hook（不覆盖其他键）。");
         if !interactive {
             return Err(Error::Config(
-                "检测到已有配置需要确认。非交互环境请加 --yes（或 --dry-run 预览）。绝不静默覆盖。"
-                    .into(),
+                "检测到已有配置需要确认。非交互环境请加 --yes 跳过确认。绝不静默覆盖。".into(),
             ));
         }
         print!("确认写入？[y/N] ");
@@ -247,6 +249,18 @@ fn undo_init(ctx: &Ctx) -> Result<i32> {
     Ok(0)
 }
 
+/// POSIX shell 单引号引用：`'` → `'\''`。
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// 判断 hook 命令是否为 airlock init 写入的条目。
+/// 用 init 写入的固定特征（AIRLOCK_SESSION_ID= + hook pretooluse）识别，
+/// 而非宽松的子串 "airlock"——避免误删用户恰好含 "airlock" 的无关 hook。
+fn is_airlock_hook(cmd: &str) -> bool {
+    cmd.contains("AIRLOCK_SESSION_ID=") && cmd.contains("hook pretooluse")
+}
+
 /// 从 JSON 配置中移除 airlock 写入的键；返回 None 表示结构里找不到 airlock 痕迹
 /// （交给快照还原兜底）。
 fn strip_airlock_json(text: &str) -> Option<String> {
@@ -262,7 +276,7 @@ fn strip_airlock_json(text: &str) -> Option<String> {
             list.retain(|e| {
                 !e.pointer("/hooks/0/command")
                     .and_then(|c| c.as_str())
-                    .map(|c| c.contains("airlock"))
+                    .map(is_airlock_hook)
                     .unwrap_or(false)
             });
             touched |= list.len() != before;
@@ -351,18 +365,14 @@ fn merge_hook(doc: &mut serde_json::Value, key: &str, subkey: &str, entry: &serd
         *list = serde_json::json!([]);
     }
     let arr = list.as_array_mut().unwrap();
-    // 已有 airlock hook 则替换（幂等）；否则追加
-    let cmd_text = entry
-        .pointer("/hooks/0/command")
-        .and_then(|c| c.as_str())
-        .unwrap_or("airlock hook");
+    // 已有 airlock hook 则替换（幂等）；否则追加（按 init 写入特征识别，
+    // 不用宽松子串 "airlock"，避免误删用户的无关 hook）
     arr.retain(|e| {
         e.pointer("/hooks/0/command")
             .and_then(|c| c.as_str())
-            .map(|c| !c.contains("airlock"))
+            .map(|c| !is_airlock_hook(c))
             .unwrap_or(true)
     });
-    let _ = cmd_text;
     arr.push(entry.clone());
 }
 
@@ -376,8 +386,11 @@ fn toml_plan(path: PathBuf, section_text: &str, marker: &str) -> Result<Planned>
         Some(text) => {
             if text.contains(marker) {
                 text.clone() // 已配置，幂等
-            } else {
+            } else if text.ends_with('\n') {
                 format!("{text}{section_text}")
+            } else {
+                // 原文件无结尾换行：先补一个，否则会拼出 `command = '/x'[section]` 式坏 TOML
+                format!("{text}\n{section_text}")
             }
         }
         None => format!("{}\n", section_text.trim_start_matches('\n')),

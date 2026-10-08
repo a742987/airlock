@@ -44,7 +44,7 @@ airlock rollback <lease-id>    # 回滚指定租约的变更
 
 ## 完整更新说明
 
-请查看 [RELEASE_NOTES.md](./RELEASE_NOTES.md) 和 [REVIEW_REPORT.md](./REVIEW_REPORT.md)
+请查看 [CHANGELOG_v2.0.0.md](./CHANGELOG_v2.0.0.md) 和 [REVIEW_REPORT.md](./REVIEW_REPORT.md)
 
 ---
 

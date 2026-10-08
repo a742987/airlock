@@ -10,7 +10,7 @@ members = [
 version = "2.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/airlock-dev/airlock"
+repository = "https://github.com/a742987/airlock"
 rust-version = "1.80"
 
 [workspace.dependencies]

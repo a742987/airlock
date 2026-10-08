@@ -176,12 +176,13 @@ pub fn resolve_layer(cfg_enforcement: &str) -> LayerState {
         "L1" | "advisory" => backends[2].probe(),
         "L2" | "landlock" => backends[1].probe(),
         "L3" | "bpf" => backends[0].probe(),
-        // auto：取可用的最高层
+        // auto：取可用的最高层。fallback = L1 probe：AdvisoryBackend
+        // available() 恒真的不变量若将来被破坏，返回 L1 报告而非 panic
         _ => backends
             .iter()
             .find(|b| b.available())
             .map(|b| b.probe())
-            .expect("L1 永远可用"),
+            .unwrap_or_else(|| backends[2].probe()),
     }
 }
 

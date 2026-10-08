@@ -16,6 +16,9 @@ use airlock_core::store::{now, Store};
 
 use crate::commands::Ctx;
 
+/// hook stdin 载荷上限：1 MiB（与 daemon 请求行上限一致）。
+const HOOK_INPUT_MAX: u64 = 1 << 20;
+
 /// Claude Code hook 的 stdin 载荷。
 #[derive(Debug, Default, serde::Deserialize)]
 struct HookInput {
@@ -101,8 +104,25 @@ pub fn handle(ctx: &Ctx, event: &str) -> Result<i32> {
     }
     let mut input = String::new();
     use std::io::Read;
-    let _ = std::io::stdin().read_to_string(&mut input);
-    let parsed: HookInput = serde_json::from_str(&input).unwrap_or_default();
+    // hook 输入限长 1 MiB：防失控的 agent 进程用超长载荷耗内存
+    let _ = std::io::stdin()
+        .lock()
+        .take(HOOK_INPUT_MAX)
+        .read_to_string(&mut input);
+    let parsed: HookInput = match serde_json::from_str(&input) {
+        Ok(p) => p,
+        Err(_) if input.trim().is_empty() => HookInput::default(),
+        // 载荷损坏不能静默当空输入放行——那会让防护悄悄失效（P7 显式可见）
+        Err(e) => {
+            eprintln!(
+                "{}",
+                ctx.out.yellow(&format!(
+                    "⚠ airlock hook 输入解析失败（{e}），本次按无写入路径放行——防护未生效，请检查 agent 的 hook 配置。"
+                ))
+            );
+            HookInput::default()
+        }
+    };
 
     let agent = std::env::var("AIRLOCK_AGENT_ID").unwrap_or_else(|_| "hook-agent".into());
     // 会话优先级（P1-1 会话统一）：init 注入的 AIRLOCK_SESSION_ID
@@ -315,6 +335,24 @@ fn split_shell_segments(cmd: &str) -> Vec<String> {
                     cur.push(c);
                 } else if c == ';' {
                     segs.push(std::mem::take(&mut cur));
+                } else if c == '&'
+                    && chars.get(i + 1) == Some(&'>')
+                    && chars
+                        .get(i + 2)
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    && cur
+                        .chars()
+                        .last()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                {
+                    // `2>&1`：fd 重定向被保守切分后会伪装成写文件 "1"——
+                    // 把完整表达式单独成段，由 segment 层识别后跳过
+                    let fd = cur.pop().unwrap();
+                    segs.push(std::mem::take(&mut cur));
+                    segs.push(format!("{fd}>&{}", chars[i + 2]));
+                    i += 2; // 消费 '>' 与目标 fd（外层再 +1 消费 '&'）
                 } else if c == '&' || c == '|' {
                     // && 与 || 是分隔符；单个 & / | 也按分隔符处理（保守多切不漏检）
                     if chars.get(i + 1) == Some(&c) {
@@ -360,7 +398,11 @@ fn segment_write_paths(seg: &str) -> Vec<String> {
                     out.push(p.to_string());
                 }
             }
-        } else if let Some(last) = tokens.iter().rev().find(|t| !t.starts_with('-')) {
+        } else if let Some(last) = tokens
+            .iter()
+            .rev()
+            .find(|t| !t.starts_with('-') && !is_fd_redirect(t))
+        {
             // 多目标命令（如 sed -i a b c）只取最后一个词——已知局限，
             // 语义宁可漏检不可误拦（误拦会打断 agent 正常工作）
             out.push(last.clone());
@@ -377,12 +419,24 @@ fn segment_write_paths(seg: &str) -> Vec<String> {
                 p
             };
             let p = p.trim_matches(|c| c == '"' || c == '\'');
-            if !p.is_empty() && !p.starts_with('-') {
-                out.push(p.to_string());
+            if p.is_empty() || p.starts_with('-') {
+                continue;
             }
+            // `2>&1` / `>&2` 类重定向到 fd：目标是文件描述符不是文件，跳过
+            // （漏检名为 "1" 的文件远好于对纯 fd 重定向产生假租约请求）
+            if p.chars().all(|c| c.is_ascii_digit()) && (t.contains(">&") || is_fd_redirect(t)) {
+                continue;
+            }
+            out.push(p.to_string());
         }
     }
     out
+}
+
+/// 形如 `2>&1` 的 fd 重定向（tokenizer 把它单独成段）。
+fn is_fd_redirect(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() == 4 && b[1] == b'>' && b[2] == b'&' && b[0].is_ascii_digit() && b[3].is_ascii_digit()
 }
 
 #[cfg(test)]
@@ -393,6 +447,14 @@ mod tests {
     fn bash_paths_extraction() {
         let ps = bash_write_paths("sed -i 's/a/b/' src/auth/login.ts");
         assert_eq!(ps, vec!["src/auth/login.ts"]);
+        // 重定向到文件描述符不是写文件：`2>&1` 不得产出目标 "1"
+        assert_eq!(
+            bash_write_paths("cargo test 2>&1 | head"),
+            Vec::<String>::new()
+        );
+        assert_eq!(bash_write_paths("make 2>&1"), Vec::<String>::new());
+        // 真正的 stderr 重定向到文件仍要检出
+        assert_eq!(bash_write_paths("make 2>build.log"), vec!["build.log"]);
         let ps = bash_write_paths("echo hi > /tmp/x.txt");
         assert_eq!(ps, vec!["/tmp/x.txt"]);
         let ps = bash_write_paths("rm src/api/old.ts");

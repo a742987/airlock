@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Airlock CLI, MCP server, agent hooks and tower TUI"
+repository.workspace = true
+keywords = ["ai", "agents", "file-leases", "coordination", "multi-agent"]
+categories = ["development-tools", "command-line-utilities"]
 
 [[bin]]
 name = "airlock"

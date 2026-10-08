@@ -372,8 +372,10 @@ impl Client {
     }
 }
 
-/// 响应行上限：1 MiB。
-const MAX_RESPONSE_BYTES: u64 = 1 << 20;
+/// 响应行上限：16 MiB。`status` 返回全部租约、`log` 最多 500 条全量 JSON，
+/// 忙碌共享仓库的合法响应可能超过 1 MiB（上限过低会让 CLI/MCP 的 status
+/// 在 daemon 完全健康时持续报错）；16 MiB 仍足以挡住失控对端的内存耗尽。
+const MAX_RESPONSE_BYTES: u64 = 16 << 20;
 
 /// 将 daemon 错误载荷还原为 Error（保持 409 型拒绝的退出码语义）。
 pub fn daemon_error(v: serde_json::Value) -> crate::error::Error {

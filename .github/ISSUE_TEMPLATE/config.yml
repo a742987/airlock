@@ -1,7 +1,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: 安全漏洞私密披露（Security Advisory）
-    url: https://github.com/airlock-dev/airlock/blob/main/SECURITY.md
+    url: https://github.com/a742987/airlock/blob/main/SECURITY.md
     about: >
       请勿以公开 issue 报告安全漏洞——按 SECURITY.md 的流程使用
       GitHub Security Advisories 私密披露（72 小时内确认，7 天内给出评估）。

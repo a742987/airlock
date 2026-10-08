@@ -240,7 +240,7 @@ F1/F2      F3           F12/F13       F11         F5          F15          F9   
 - **API 稳定性承诺（v1.0 起）**：MCP 工具名/参数、CLI 退出码、租约协议版本化（semver），破坏性变更走 RFC + 一个大版本的弃用期——这是"完整产品"可信度的一部分；
 - 插件机制（v3.0）：enforcement backend、policy 规则源、黑板消费者三个扩展点，其余不开放插件以保安全边界。
 
-**安装体验**：`curl -fsSL https://raw.githubusercontent.com/airlock-dev/airlock/main/scripts/install.sh | sh` / `brew install airlock` → `airlock init`（配置 hooks+MCP，运行 doctor 报告当前层）。L2 需 Linux ≥5.13 内核（含 WSL2），安装脚本优雅降级并明说"你当前在 L1/L2"；L3 尚未实现，doctor 会明示"规划中"——绝无静默失效。
+**安装体验**：`curl -fsSL https://raw.githubusercontent.com/a742987/airlock/main/scripts/install.sh | sh` / `brew install airlock` → `airlock init`（配置 hooks+MCP，运行 doctor 报告当前层）。L2 需 Linux ≥5.13 内核（含 WSL2），安装脚本优雅降级并明说"你当前在 L1/L2"；L3 尚未实现，doctor 会明示"规划中"——绝无静默失效。
 
 ---
 

@@ -3,6 +3,8 @@ name = "airlockd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Airlock daemon: lease engine, resource allocation and hash-chained audit log over a unix socket"
+repository.workspace = true
 
 [dependencies]
 airlock-core = { path = "../airlock-core" }

@@ -5,7 +5,7 @@
 //! SQLite 损坏时拒绝启动（§8.4：宁可不可用，不可假保护）。
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -23,6 +23,9 @@ use airlock_core::store::{now, Store};
 use airlock_core::{lease, messages, Error as AirlockError};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// 活跃连接线程上限：超过后 accept 循环内联串行处理（背压），防连接洪泛耗尽内存。
+const MAX_CONN_THREADS: usize = 64;
+static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 extern "C" fn on_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -189,6 +192,12 @@ fn main() {
         cfg.listen_addr = listen_addr;
     }
 
+    // 数据目录收紧为 0700：租约状态、审计链、F13 凭据源文件都在这里
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&domain.dir, std::fs::Permissions::from_mode(0o700));
+    }
+
     // SQLite 损坏 → 拒绝启动（§8.4），错误信息含修复指引（messages::SQLITE_CORRUPT）
     let store = match Store::open(&domain.db_path()) {
         Ok(s) => Arc::new(Mutex::new(s)),
@@ -220,14 +229,33 @@ fn main() {
         started_at: boot_ts,
     };
 
-    // 单实例保护（P2-1）：socket 可连接 = 已有 daemon 在跑（幂等成功）；
-    // 连不上 = 陈旧残留，稍后清理再绑定。检查必须在 daemonize 之前，
-    // 避免第二个实例先 fork 再退出、重复写 boot 审计。
-    let sock = daemon.domain.socket_path();
-    if sock.exists() && UnixStream::connect(&sock).is_ok() {
-        println!("airlockd 已在运行（{}）", sock.display());
-        return;
-    }
+    // 单实例保护（P2-1）：对 pid 文件持独占 flock——检查与持有是同一个原子
+    // 操作，杜绝「检查时没跑、bind 前第二个实例也通过检查」的竞态窗口。
+    // fd 在整个进程生命周期内保持打开（fork 继承，daemonize 后锁仍归子进程）。
+    let _pid_guard = {
+        let pid_path = daemon.domain.pid_path();
+        let file = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&pid_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("无法打开 pid 文件 {}: {e}", pid_path.display());
+                std::process::exit(5);
+            }
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            println!(
+                "airlockd 已在运行（pid 文件 {} 被占用）",
+                pid_path.display()
+            );
+            return;
+        }
+        file
+    };
 
     // TCP 复用完整的特权协议，只允许绑定回环地址。跨机监听没有认证层，
     // 因此必须在 daemonize 和 Unix socket 创建前拒绝非本机暴露。
@@ -354,7 +382,8 @@ fn main() {
     }
 
     let sock = daemon.domain.socket_path();
-    let _ = std::fs::remove_file(&sock); // 清理陈旧残留（活 daemon 已在上方排除）
+    // 清理陈旧残留：flock 已确保本进程是唯一 daemon，此时才允许移除旧 socket
+    let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
@@ -362,6 +391,12 @@ fn main() {
             std::process::exit(5);
         }
     };
+    // socket 收紧为 0600：协议唯一「认证」是客户端自报的 session_id，
+    // 权限必须由文件模式保证（不能依赖 umask——某些发行版默认 000/002）
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+    }
     // Optional local TCP transport. The wire format is the same versioned
     // NDJSON protocol as the Unix socket; bind_local_tcp_listener enforces
     // loopback-only access because this protocol has no authentication layer.
@@ -379,19 +414,7 @@ fn main() {
             while !SHUTDOWN.load(Ordering::SeqCst) {
                 match tcp.accept() {
                     Ok((s, _)) => {
-                        let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
-                        let _ = s.set_write_timeout(Some(Duration::from_secs(30)));
-                        let d = Daemon {
-                            store: Arc::clone(&d.store),
-                            domain: d.domain.clone(),
-                            cfg: d.cfg.clone(),
-                            layer: d.layer.clone(),
-                            protection_gap_s: d.protection_gap_s,
-                            started_at: d.started_at,
-                        };
-                        std::thread::spawn(move || {
-                            let _ = handle_conn(s, &d);
-                        });
+                        spawn_conn_handler(s, &d);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(50));
@@ -426,20 +449,7 @@ fn main() {
         }
         match listener.accept() {
             Ok((s, _)) => {
-                let _ = s.set_nonblocking(false);
-                let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
-                let _ = s.set_write_timeout(Some(Duration::from_secs(30)));
-                let d = Daemon {
-                    store: Arc::clone(&daemon.store),
-                    domain: daemon.domain.clone(),
-                    cfg: daemon.cfg.clone(),
-                    layer: daemon.layer.clone(),
-                    protection_gap_s: daemon.protection_gap_s,
-                    started_at: daemon.started_at,
-                };
-                std::thread::spawn(move || {
-                    let _ = handle_conn(s, &d);
-                });
+                spawn_conn_handler(s, &daemon);
             }
             Err(_) => continue,
         }
@@ -453,9 +463,19 @@ fn main() {
 }
 
 fn bind_local_tcp_listener(addr: &str) -> io::Result<TcpListener> {
-    let listener = TcpListener::bind(addr)?;
-    let bound = listener.local_addr()?;
-    validate_local_tcp_addr(bound)?;
+    // 先解析并校验，再绑定：若先 bind 后校验，会存在短暂监听在
+    // 全部接口上的窗口（外部连接可趁虚而入）
+    let resolved: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
+    let Some(target) = resolved.first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("无法解析监听地址 {addr}"),
+        ));
+    };
+    validate_local_tcp_addr(*target)?;
+    let listener = TcpListener::bind(*target)?;
+    // 双重校验：bind 可能改写端口（:0）或按系统解析回退到非回环地址
+    validate_local_tcp_addr(listener.local_addr()?)?;
     Ok(listener)
 }
 
@@ -470,7 +490,12 @@ fn validate_local_tcp_addr(bound: SocketAddr) -> io::Result<()> {
 }
 
 fn daemonize(domain: &Domain) {
-    let log = std::fs::File::create(domain.dir.join("daemon.log")).ok();
+    // 追加而非截断：重启后仍保留上次崩溃前的日志（事后取证需要）
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(domain.dir.join("daemon.log"))
+        .ok();
     unsafe {
         let pid = libc::fork();
         if pid > 0 {
@@ -498,11 +523,29 @@ trait ProtocolStream: Read + Write {
     fn clone_stream(&self) -> std::io::Result<Self>
     where
         Self: Sized;
+
+    fn configure(&self) {
+        let _ = self.set_nonblocking_read(60);
+        let _ = self.set_nonblocking_write(30);
+    }
+
+    fn set_nonblocking_read(&self, secs: u64) -> std::io::Result<()>;
+    fn set_nonblocking_write(&self, secs: u64) -> std::io::Result<()>;
+    fn disable_nonblocking(&self) -> std::io::Result<()>;
 }
 
 impl ProtocolStream for UnixStream {
     fn clone_stream(&self) -> std::io::Result<Self> {
         self.try_clone()
+    }
+    fn set_nonblocking_read(&self, secs: u64) -> std::io::Result<()> {
+        self.set_read_timeout(Some(Duration::from_secs(secs)))
+    }
+    fn set_nonblocking_write(&self, secs: u64) -> std::io::Result<()> {
+        self.set_write_timeout(Some(Duration::from_secs(secs)))
+    }
+    fn disable_nonblocking(&self) -> std::io::Result<()> {
+        self.set_nonblocking(false)
     }
 }
 
@@ -510,6 +553,39 @@ impl ProtocolStream for std::net::TcpStream {
     fn clone_stream(&self) -> std::io::Result<Self> {
         self.try_clone()
     }
+    fn set_nonblocking_read(&self, secs: u64) -> std::io::Result<()> {
+        self.set_read_timeout(Some(Duration::from_secs(secs)))
+    }
+    fn set_nonblocking_write(&self, secs: u64) -> std::io::Result<()> {
+        self.set_write_timeout(Some(Duration::from_secs(secs)))
+    }
+    fn disable_nonblocking(&self) -> std::io::Result<()> {
+        self.set_nonblocking(false)
+    }
+}
+
+/// 连接处理：优先派线程；达到上限后在调用线程内联串行处理（背压）。
+fn spawn_conn_handler<S: ProtocolStream + Send + 'static>(s: S, base: &Daemon) {
+    let _ = s.disable_nonblocking();
+    s.configure();
+    let d = Daemon {
+        store: Arc::clone(&base.store),
+        domain: base.domain.clone(),
+        cfg: base.cfg.clone(),
+        layer: base.layer.clone(),
+        protection_gap_s: base.protection_gap_s,
+        started_at: base.started_at,
+    };
+    if ACTIVE_CONNS.load(Ordering::SeqCst) >= MAX_CONN_THREADS {
+        // 上限已到：内联处理会阻塞 accept 循环——这正是背压，新连接排队等待
+        let _ = handle_conn(s, &d);
+        return;
+    }
+    ACTIVE_CONNS.fetch_add(1, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let _ = handle_conn(s, &d);
+        ACTIVE_CONNS.fetch_sub(1, Ordering::SeqCst);
+    });
 }
 
 fn handle_conn<S: ProtocolStream>(stream: S, d: &Daemon) -> Result<()> {
@@ -549,10 +625,9 @@ const MAX_REQUEST_BYTES: u64 = 1 << 20;
 fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
     let p = &req.params;
     let result: Result<serde_json::Value> = (|| {
-        let store = d
-            .store
-            .lock()
-            .map_err(|_| Error::Other("存储锁中毒".into()))?;
+        // 中毒恢复而非报错：一次 panic 后 catch_unwind 已兜住本连接，
+        // 锁必须恢复可用，否则后续所有请求都会砖掉（P2-3）
+        let store = lock_store(&d.store);
         match req.method.as_str() {
             "ping" => Ok(serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
@@ -581,6 +656,11 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                 let glob = str_or(p, "glob", "");
                 if glob.is_empty() {
                     return Err(Error::Config("claim 需要 glob 参数".into()));
+                }
+                // 空 session_id 会产生 owner 永远无法 release 的租约（release/heartbeat
+                // 都要求非空 session_id），必须与它们一致地拒绝
+                if session_id.is_empty() {
+                    return Err(Error::Config("claim 需要 session_id".into()));
                 }
                 let params = lease::ClaimParams {
                     conflict_domain: d.domain.id.clone(),
@@ -618,12 +698,28 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                 if glob.is_empty() {
                     return Err(Error::Config("ensure_claim 需要 glob 参数".into()));
                 }
+                if session_id.is_empty() {
+                    return Err(Error::Config("ensure_claim 需要 session_id".into()));
+                }
+                // 入口 glob 与 claim 同标准校验：快路径也不能绕过
+                if let Err(m) = airlock_core::glob::validate_pattern(&glob) {
+                    return Err(Error::Config(format!("非法 glob: {m}")));
+                }
                 let now_ts = now();
                 let actives = store.active_leases(Some(&d.domain.id), now_ts)?;
                 if let Some(existing) = actives.iter().find(|l| {
                     l.session_id == session_id && airlock_core::glob::overlaps(&glob, &l.glob)
                 }) {
                     store.update_lease_heartbeat(&existing.id, now_ts, now_ts + existing.ttl_s)?;
+                    // 续约计入审计链（与 lease::heartbeat 口径一致）
+                    store.audit(
+                        "heartbeat",
+                        &actor_from(p),
+                        &existing.glob,
+                        Some(&existing.id),
+                        &d.layer.id,
+                        Some(&serde_json::json!({ "event_detail": "ensure_claim_renew" })),
+                    )?;
                     let mut renewed = existing.clone();
                     renewed.last_heartbeat = now_ts;
                     renewed.expires_at = now_ts + existing.ttl_s;
@@ -736,6 +832,21 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                 if lease_id.is_empty() {
                     return Err(Error::Config("report_cost 需要 lease_id".into()));
                 }
+                // 属主校验（与 release/heartbeat 同级）：凭 lease_id 不能改别人的账
+                let session = str_or(p, "session_id", "");
+                if session.is_empty() {
+                    return Err(Error::Config(
+                        "report_cost 需要 session_id（属主校验）".into(),
+                    ));
+                }
+                let lease = store
+                    .get_lease(&lease_id)?
+                    .ok_or_else(|| Error::NotFound(format!("租约 {lease_id} 不存在")))?;
+                if lease.session_id != session {
+                    return Err(Error::Config(format!(
+                        "租约 {lease_id} 不属于会话 {session}"
+                    )));
+                }
                 store.update_lease_cost(&lease_id, tokens, cost_cents)?;
                 Ok(serde_json::json!({ "report_cost": "ok" }))
             }
@@ -743,6 +854,20 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                 let lease_id = str_or(p, "lease_id", "");
                 if lease_id.is_empty() {
                     return Err(Error::Config("rollback 需要 lease_id".into()));
+                }
+                // 属主校验：rollback 会 git restore 该租约的文件，凭 lease_id
+                // （status 可枚举）不能回滚别的会话正在进行的工作
+                let session = str_or(p, "session_id", "");
+                if session.is_empty() {
+                    return Err(Error::Config("rollback 需要 session_id（属主校验）".into()));
+                }
+                let lease = store
+                    .get_lease(&lease_id)?
+                    .ok_or_else(|| Error::NotFound(format!("租约 {lease_id} 不存在")))?;
+                if lease.session_id != session {
+                    return Err(Error::Config(format!(
+                        "租约 {lease_id} 不属于会话 {session}"
+                    )));
                 }
                 let snap_dir = d.domain.root.join(".airlock").join("snapshots");
                 let snapshot = airlock_core::snapshot::load_snapshot_from(&snap_dir, &lease_id)?;
@@ -806,7 +931,7 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
                     p.get("token_budget")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(d.cfg.board_token_budget as u64) as usize;
-                Ok(serde_json::to_value(&store.board_read(budget)?)?)
+                Ok(serde_json::to_value(&store.board_read(budget, 7)?)?)
             }
             "board_write" => {
                 let body = str_or(p, "body", "");
@@ -869,7 +994,20 @@ fn dispatch(req: &proto::Request, d: &Daemon) -> proto::Response {
             "branch_db" => {
                 let path = PathBuf::from(str_or(p, "path", ""));
                 let session_id = str_or(p, "session_id", "");
-                let out = resources::branch_sqlite(&path, &d.domain.session_dir(&session_id))?;
+                // session_id 会拼进数据目录路径、path 会被读取复制：
+                // 都是不可信输入。session_id 限定 daemon 自签的 UUID 字符集，
+                // path 限定在仓库根之内。
+                if !is_safe_session_id(&session_id) {
+                    return Err(Error::Config("branch_db 需要合法的 session_id".into()));
+                }
+                let canon_path = path.canonicalize().map_err(|_| {
+                    Error::Config(format!("branch_db 源库不存在: {}", path.display()))
+                })?;
+                if !canon_path.starts_with(&d.domain.root) {
+                    return Err(Error::Config("branch_db 的 path 必须位于仓库内".into()));
+                }
+                let out =
+                    resources::branch_sqlite(&canon_path, &d.domain.session_dir(&session_id))?;
                 Ok(serde_json::json!({ "session_db": out.to_string_lossy() }))
             }
             "degrade" => {
@@ -948,6 +1086,12 @@ fn str_or(p: &serde_json::Value, key: &str, default: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or(default)
         .to_string()
+}
+
+/// session_id 用作路径组件（sessions/<sid>/…）时的白名单校验：
+/// daemon 自签的是 UUID，只接受 `[A-Za-z0-9-]`，显式杜绝 `../` 类注入。
+fn is_safe_session_id(sid: &str) -> bool {
+    !sid.is_empty() && sid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 fn opt_str(p: &serde_json::Value, key: &str) -> Option<String> {

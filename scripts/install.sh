@@ -14,7 +14,9 @@
 #   （daemon 数据在各仓库 <git-common-dir>/airlock/ 下，按需删除）
 set -eu
 
-REPO="https://github.com/airlock-dev/airlock"
+REPO="https://github.com/a742987/airlock"
+# 安装锁定在发布 tag 上，保证 Cargo.lock 可复现构建；每次发版后随 README 一起更新。
+TAG="v2.0.0"
 INSTALL_DIR="${AIRLOCK_INSTALL_DIR:-$HOME/.local/bin}"
 CARGO_ROOT="$(dirname "$INSTALL_DIR")"
 
@@ -46,8 +48,10 @@ fi
 need_tool cc "rusqlite（bundled SQLite）编译需要 C 编译器，通常由 gcc/clang 提供"
 need_tool git "Airlock 依赖 git 解析冲突域"
 
-say "→ 构建并安装 airlock / airlockd 到 $INSTALL_DIR（首次约 1–3 分钟）"
-cargo install --git "$REPO" --root "$CARGO_ROOT" airlock-cli || {
+say "→ 构建并安装 airlock / airlockd 到 $INSTALL_DIR（锁定 $TAG，首次约 1–3 分钟）"
+# --locked：按仓库内 Cargo.lock 构建，依赖版本与发布时完全一致。
+# --tag：每次发版后更新此处的 TAG 变量（见上方注释）。
+cargo install --git "$REPO" --tag "$TAG" --locked --root "$CARGO_ROOT" airlock-cli || {
     say "✗ cargo install 失败——可改为克隆仓库手动构建："
     say "  git clone $REPO && cd airlock && cargo build --release"
     exit 1
@@ -58,15 +62,32 @@ mkdir -p "$INSTALL_DIR"
 # 自定义 AIRLOCK_INSTALL_DIR 时，此链接把二进制接到你指定的目录。
 ln -sf "$CARGO_ROOT/bin/airlock" "$INSTALL_DIR/airlock" 2>/dev/null || true
 
+# 安装后确认二进制在 PATH 上；不在则给出可直接复制的 export 行。
+if ! command -v airlock >/dev/null 2>&1; then
+    say ""
+    say "⚠ airlock 不在当前 PATH 中——请将其加入后再使用："
+    say "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    say "  （可把上行写入 ~/.profile 或 ~/.zshrc 以永久生效）"
+fi
+
+# Landlock（L2）要求 Linux 内核 ≥ 5.13；过旧则明说会运行在 L1 advisory。
+KERNEL_LAYER_NOTE=""
 case "$(uname -s)" in
     Linux)
-        LAYER_HINT="Linux + 内核 Landlock 可用时自动进入 L2（真实拒绝）"
+        _k="$(uname -r | cut -d. -f1-2)"   # 形如 6.8 / 5.15
+        _kmaj="$(printf '%s' "$_k" | cut -d. -f1)"
+        _kmin="$(printf '%s' "$_k" | cut -d. -f2)"
+        if [ "$_kmaj" -gt 5 ] || { [ "$_kmaj" = "5" ] && [ "$_kmin" -ge 13 ]; } 2>/dev/null; then
+            KERNEL_LAYER_NOTE="内核 $_k 支持 Landlock：可用时自动进入 L2（真实拒绝）"
+        else
+            KERNEL_LAYER_NOTE="内核过旧：你将运行在 L1 advisory"
+        fi
         ;;
     Darwin)
-        LAYER_HINT="macOS 上你将运行在 L1 advisory（内核强制不可用，属预期而非错误）"
+        KERNEL_LAYER_NOTE="macOS 上你将运行在 L1 advisory（内核强制不可用，属预期而非错误）"
         ;;
     *)
-        LAYER_HINT="当前平台仅 L1 advisory"
+        KERNEL_LAYER_NOTE="当前平台仅 L1 advisory"
         ;;
 esac
 
@@ -75,7 +96,7 @@ say "✓ 安装完成。下一步（60 秒上手）："
 say ""
 say "  cd your-repo"
 say "  airlock daemon start     # 启动守护进程"
-say "  airlock doctor           # 看你处在哪一层（$LAYER_HINT）"
+say "  airlock doctor           # 看你处在哪一层（$KERNEL_LAYER_NOTE）"
 say "  airlock init claude-code # 接入你的 agent（支持 codex/gemini/cursor/opencode）"
 say ""
 say "然后正常开你的 agent——第一次 Edit 前会自动 claim。"

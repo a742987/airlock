@@ -217,10 +217,11 @@ pub fn heartbeat(ctx: &Ctx, lease_id: &str) -> Result<i32> {
 }
 
 pub fn report_cost(ctx: &Ctx, lease_id: &str, tokens: u64, cost_cents: u64) -> Result<i32> {
+    let (agent, session) = ctx.session()?;
     let mut c = ctx.client()?;
     let v = c.call(
         "report_cost",
-        &serde_json::json!({ "lease_id": lease_id, "tokens": tokens, "cost_cents": cost_cents }),
+        &serde_json::json!({ "lease_id": lease_id, "tokens": tokens, "cost_cents": cost_cents, "agent_id": agent, "session_id": session }),
     )?;
     ctx.out.either(&v, &ctx.out.green("✓ 成本已上报"));
     Ok(0)

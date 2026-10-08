@@ -56,7 +56,14 @@ pub fn validate_pattern(pattern: &str) -> Result<(), String> {
 }
 
 /// 路径模式是否匹配具体路径。
+///
+/// 绝对路径模式一律拒绝（返回 false）：claim/政策入口已由
+/// `validate_pattern` 拒绝绝对模式，这里再挡一道——未来调用方传入
+/// 用户可控的绝对模式时，静默剥离前导 `/` 会变成隐式放宽而非拒绝。
 pub fn matches(pattern: &str, path: &str) -> bool {
+    if pattern.starts_with('/') || path.starts_with('/') {
+        return false;
+    }
     let (Some(p), Some(s)) = (normalize_segments(pattern), normalize_segments(path)) else {
         return false;
     };
@@ -80,8 +87,11 @@ fn seg_match(p: &[&str], s: &[&str]) -> bool {
     dp[0][0]
 }
 
-/// 两个模式是否可能匹配同一条具体路径。
+/// 两个模式是否可能匹配同一条具体路径（绝对模式一律 false，理由同 [`matches`]）。
 pub fn overlaps(a: &str, b: &str) -> bool {
+    if a.starts_with('/') || b.starts_with('/') {
+        return false;
+    }
     let (Some(pa), Some(pb)) = (normalize_segments(a), normalize_segments(b)) else {
         return false;
     };
@@ -232,9 +242,10 @@ mod tests {
         // 归一化后相等的路径仍应匹配
         assert!(matches("src/auth/**", "src/auth/./login.ts"));
         assert!(matches("src/auth/**", "src/x/../auth/login.ts"));
-        // 绝对/相对混同不再成立：两侧都归一化为相对段后才比较
-        assert!(matches("/etc/**", "etc/passwd"));
-        assert!(matches("/etc/**", "/etc/passwd"));
+        // 绝对模式/绝对路径一律不匹配：接口层拒绝而非静默剥离前导 `/`
+        assert!(!matches("/etc/**", "etc/passwd"));
+        assert!(!matches("/etc/**", "/etc/passwd"));
+        assert!(!overlaps("/etc/**", "etc/**"));
     }
 
     #[test]

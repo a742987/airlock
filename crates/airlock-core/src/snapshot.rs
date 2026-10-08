@@ -114,6 +114,47 @@ pub fn git_working_dir_changes(repo_root: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// 将快照中的相对路径归一化并校验仍位于仓库内。
+///
+/// 快照 JSON 可能被仓库内任意进程写入，`changed_files` 属于不可信输入：
+/// 绝对路径、`..`、空路径一律拒绝（`Path::starts_with` 不归一化 `..`，
+/// 单独使用会被 `/repo/../../x` 绕过，因此必须先做组件归一化）。
+fn safe_repo_path(repo_root: &Path, f: &str) -> Option<PathBuf> {
+    let rel = Path::new(f);
+    if f.is_empty() || rel.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(c) => normalized.push(c),
+            std::path::Component::CurDir => {}
+            // ParentDir / RootDir / Prefix 一律拒绝
+            _ => return None,
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return None;
+    }
+    let full = repo_root.join(normalized);
+    if full.starts_with(repo_root) {
+        Some(full)
+    } else {
+        None
+    }
+}
+
+/// 校验 lease_id 可安全用作文件名（拒绝路径分隔符与 `..`）。
+fn safe_lease_id(lease_id: &str) -> bool {
+    !lease_id.is_empty()
+        && lease_id != "."
+        && lease_id != ".."
+        && !lease_id.contains('/')
+        && !lease_id.contains('\\')
+        && !lease_id.contains("..")
+        && !lease_id.contains('\0')
+}
+
 /// 恢复指定文件到某个 commit 的状态。
 pub fn git_restore_files_to_commit(
     repo_root: &Path,
@@ -124,6 +165,11 @@ pub fn git_restore_files_to_commit(
         return Ok(());
     }
     for f in files {
+        // 不可信输入：不在仓库内的路径（含遍历构造）直接跳过
+        let path = match safe_repo_path(repo_root, f) {
+            Some(p) => p,
+            None => continue,
+        };
         let exists = Command::new("git")
             .args(["cat-file", "-e", &format!("{commit_hash}:{f}")])
             .current_dir(repo_root)
@@ -142,14 +188,11 @@ pub fn git_restore_files_to_commit(
                     String::from_utf8_lossy(&output.stderr)
                 )));
             }
-        } else {
-            let path = repo_root.join(f);
-            if path.starts_with(repo_root) && path.exists() {
-                if path.is_dir() {
-                    std::fs::remove_dir_all(path)?;
-                } else {
-                    std::fs::remove_file(path)?;
-                }
+        } else if path.exists() {
+            if path.is_dir() {
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::remove_file(path)?;
             }
         }
     }
@@ -204,6 +247,12 @@ pub fn save_snapshot(domain_root: &Path, snapshot: &LeaseSnapshot) -> Result<()>
 
 /// 保存快照到指定目录。
 pub fn save_snapshot_to(dir: &Path, snapshot: &LeaseSnapshot) -> Result<()> {
+    if !safe_lease_id(&snapshot.lease_id) {
+        return Err(Error::Other(format!(
+            "非法 lease_id: {:?}",
+            snapshot.lease_id
+        )));
+    }
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.json", snapshot.lease_id));
     let json = serde_json::to_string_pretty(snapshot)?;
@@ -219,6 +268,9 @@ pub fn load_snapshot(domain_root: &Path, lease_id: &str) -> Result<Option<LeaseS
 
 /// 从指定目录加载快照。
 pub fn load_snapshot_from(dir: &Path, lease_id: &str) -> Result<Option<LeaseSnapshot>> {
+    if !safe_lease_id(lease_id) {
+        return Err(Error::Other(format!("非法 lease_id: {lease_id:?}")));
+    }
     let path = dir.join(format!("{}.json", lease_id));
     if !path.exists() {
         return Ok(None);
@@ -256,6 +308,9 @@ pub fn list_snapshots_from(dir: &Path) -> Result<Vec<LeaseSnapshot>> {
 
 /// 删除快照。
 pub fn delete_snapshot(domain_root: &Path, lease_id: &str) -> Result<()> {
+    if !safe_lease_id(lease_id) {
+        return Err(Error::Other(format!("非法 lease_id: {lease_id:?}")));
+    }
     let direct = domain_root.join(format!("{}.json", lease_id));
     let dir = if direct.exists()
         || domain_root.file_name().and_then(|n| n.to_str()) == Some("snapshots")
@@ -317,5 +372,46 @@ mod tests {
         assert!(loaded.is_none());
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rollback_rejects_path_traversal() {
+        // 回滚文件列表来自可被任意进程写入的快照 JSON：`..` 构造不得
+        // 删除仓库外文件（审查 P1：starts_with 不归一化 `..`）
+        let repo = std::env::temp_dir().join(format!("airlock-snap-repo-{}", uuid::Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("airlock-snap-out-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(&outside, b"victim").unwrap();
+
+        // 文件不存在于 commit → 走文件删除分支；遍历路径必须被拒绝
+        git_restore_files_to_commit(
+            &repo,
+            &[
+                format!("../{}", outside.file_name().unwrap().to_string_lossy()),
+                "../../etc/passwd".into(),
+                "/etc/passwd".into(),
+            ],
+            "deadbeef",
+        )
+        .unwrap();
+        assert!(outside.exists(), "仓库外文件不得被删除");
+
+        // lease_id 用作文件名：路径分隔符与 `..` 一律拒绝
+        let dir = std::env::temp_dir().join(format!("airlock-snap-dir-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(load_snapshot_from(&dir, "../../x").is_err());
+        assert!(load_snapshot_from(&dir, "a/b").is_err());
+        assert!(load_snapshot_from(&dir, "").is_err());
+        // 合法 id 不受影响
+        assert!(
+            load_snapshot_from(&dir, "550e8400-e29b-41d4-a716-446655440000")
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(&repo).ok();
+        fs::remove_file(&outside).ok();
+        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -114,7 +114,8 @@ fn ac4_2_init_confirm_never_silent_overwrite() {
         .expect("hook 命令存在")
         .to_string();
     assert!(
-        hook_cmd.contains(&format!("AIRLOCK_SESSION_ID={sid}")),
+        // hook 命令现在对值做 POSIX 单引号引用（路径含空格/引号不再静默失效）
+        hook_cmd.contains(&format!("AIRLOCK_SESSION_ID='{sid}'")),
         "hook 命令应注入同一会话：{hook_cmd}"
     );
 

@@ -30,12 +30,17 @@ use crate::commands::Ctx;
 /// 不再把租约泄漏 30 分钟）。
 static RUN_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+/// 同一信号的到达次数：子进程吞掉第一次 SIGINT 时，第二次直接 SIGKILL。
+static SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn run_on_signal(sig: libc::c_int) {
     RUN_INTERRUPTED.store(true, Ordering::SeqCst);
     let pid = CHILD_PID.load(Ordering::SeqCst);
     if pid > 0 {
-        unsafe { libc::kill(pid, sig) };
+        // SA_RESTART 语义下父进程的 wait 会自动重启：如果子进程忽略/吞掉
+        // 转发的信号，第二次 Ctrl+C 必须升级为 SIGKILL，否则父进程永远等待
+        let escalate = sig == libc::SIGINT && SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst) >= 1;
+        let _ = unsafe { libc::kill(pid, if escalate { libc::SIGKILL } else { sig }) };
     }
 }
 
@@ -516,13 +521,16 @@ pub fn run_wrapped(ctx: &Ctx, args: &[String]) -> Result<i32> {
 
     if run.dry_run {
         if ctx.out.json {
+            // dry-run 计划常被粘贴进 issue/日志：环境变量值一律掩码，只显示键名
+            let env_keys: std::collections::BTreeMap<&String, &str> =
+                port_env.keys().map(|k| (k, "********")).collect();
             let plan = serde_json::json!({
                 "session": session.session_id,
                 "leases": lease_ids,
                 "allowed_write": allowed,
                 "policy_denied_write": denied,
                 "cmd": run.cmd,
-                "env": port_env,
+                "env": env_keys,
             });
             println!("{}", serde_json::to_string_pretty(&plan)?);
         } else {
